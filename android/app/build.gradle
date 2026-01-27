@@ -2,6 +2,15 @@ apply plugin: "com.android.application"
 apply plugin: "org.jetbrains.kotlin.android"
 apply plugin: "com.facebook.react"
 
+repositories {
+    maven {
+        // Official Bridgefy Repository
+        url "http://34.82.5.94:8081/artifactory/libs-release-local"
+        allowInsecureProtocol = true
+    }
+    mavenCentral()
+    google()
+}
 /**
  * This is the configuration block to customize your React Native Android app.
  * By default you don't need to apply any configuration, just uncomment the lines you need.
@@ -77,6 +86,12 @@ android {
     buildToolsVersion rootProject.ext.buildToolsVersion
     compileSdk rootProject.ext.compileSdkVersion
 
+    compileOptions {
+        coreLibraryDesugaringEnabled true
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+
     namespace "com.peerreach"
     defaultConfig {
         applicationId "com.peerreach"
@@ -84,6 +99,8 @@ android {
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1
         versionName "1.0"
+
+        multiDexEnabled true
     }
     signingConfigs {
         debug {
@@ -116,4 +133,11 @@ dependencies {
     } else {
         implementation jscFlavor
     }
+    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.4'
+    // implementation files('libs/android-sdk-1.2.3.aar')
+    // implementation 'com.google.code.gson:gson:2.10.1'
+    // implementation(group: 'me.bridgefy', name: 'android-sdk', version: '1.2.3', ext: 'aar') {
+    //     transitive = true
+    // }
+    implementation 'me.bridgefy:android-sdk:1.2.3'
 }

@@ -18,4 +18,16 @@ buildscript {
     }
 }
 
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+        // Bridgefy's repository (REQUIRED for URL fetch)
+        maven { 
+            url "http://34.82.5.94:8081/artifactory/libs-release-local"
+            allowInsecureProtocol = true 
+        }
+    }
+}
+
 apply plugin: "com.facebook.react.rootproject"
