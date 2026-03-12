@@ -1,5 +1,6 @@
 // src/services/BridgefyService.js - UPDATED FOR SQLITE
 import { NativeModules, NativeEventEmitter, Platform, AppState } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import databaseService from './DatabaseService';
 
 const { Bridgefy } = NativeModules;
@@ -95,7 +96,54 @@ class BridgefyService {
       await this.handleIncomingMessage(rawMessage, true);
     });
 
-    // ... rest of event listeners remain similar
+    bridgefyEmitter.addListener('onRegistrationFailed', (error) => {
+      console.error('âŒ Bridgefy registration failed:', error);
+      this.emitEvent('onError', error);
+    });
+
+    bridgefyEmitter.addListener('onDeviceListUpdated', async (data) => {
+      console.log('ðŸ“± Device list updated:', data?.devices?.length);
+      if (data?.devices && Array.isArray(data.devices)) {
+        for (const device of data.devices) {
+          if (device.id && device.name) {
+            this.connectedDevices.set(device.id, device.name);
+            await databaseService.saveDevice({
+              id: device.id,
+              name: device.name,
+              connection_status: 'online'
+            });
+          }
+        }
+        this.emitEvent('onDeviceListUpdated', {
+          devices: Array.from(this.connectedDevices.entries()).map(([id, name]) => ({ id, name }))
+        });
+      }
+    });
+
+    bridgefyEmitter.addListener('onMessageSent', (data) => {
+      console.log('âœ… Message sent:', data);
+      this.emitEvent('onMessageSent', data);
+    });
+
+    bridgefyEmitter.addListener('onMessageSendFailed', (error) => {
+      console.error('âŒ Message send failed:', error);
+      this.emitEvent('onMessageSendFailed', error);
+    });
+
+    bridgefyEmitter.addListener('onStarted', () => {
+      console.log('ðŸš€ Bridgefy service started');
+      this.emitEvent('onStarted', {});
+    });
+
+    bridgefyEmitter.addListener('onStartError', (error) => {
+      console.error('âŒ Bridgefy start error:', error);
+      this.emitEvent('onStartError', error);
+    });
+
+    bridgefyEmitter.addListener('onStopped', () => {
+      console.log('ðŸ›‘ Bridgefy service stopped');
+      this.emitEvent('onStopped', {});
+    });
   }
 
   async handleIncomingMessage(rawMessage, isBroadcast) {
@@ -164,6 +212,26 @@ class BridgefyService {
       
     } catch (error) {
       console.error('❌ Error handling incoming message:', error);
+    }
+  }
+
+  showNotification(message) {
+    console.log(
+      `ðŸ”” NEW ${message.isBroadcast ? 'BROADCAST' : 'MESSAGE'} from ${message.senderName}: ${message.text.substring(0, 50)}...`
+    );
+  }
+
+  handleAppStateChange(nextState) {
+    // Pause background work when not active; refresh unread counts on resume.
+    if (nextState === 'active') {
+      this.emitEvent('onUnreadUpdated', this.getUnreadCounts());
+      return;
+    }
+
+    if (nextState === 'background' || nextState === 'inactive') {
+      if (this.currentChatId !== null) {
+        this.currentChatId = null;
+      }
     }
   }
 
@@ -264,21 +332,35 @@ class BridgefyService {
 
   async getConnectedDevices() {
     try {
-      const devices = await databaseService.getAllDevices();
-      // Filter out my own device and offline devices
-      const onlineDevices = devices.filter(device => 
-        device.id !== this.myDeviceId && device.connection_status === 'online'
-      );
-      
-      // Update local map
-      onlineDevices.forEach(device => {
-        this.connectedDevices.set(device.id, device.name);
-      });
-      
-      return onlineDevices.map(device => ({ id: device.id, name: device.name }));
-    } catch (error) {
-      console.error('❌ Error getting devices:', error);
+      const devices = await Bridgefy.getConnectedDevices();
+      if (devices && Array.isArray(devices)) {
+        for (const device of devices) {
+          if (device.id && device.name) {
+            this.connectedDevices.set(device.id, device.name);
+            await databaseService.saveDevice({
+              id: device.id,
+              name: device.name,
+              connection_status: 'online'
+            });
+          }
+        }
+      }
       return Array.from(this.connectedDevices.entries()).map(([id, name]) => ({ id, name }));
+    } catch (error) {
+      console.error('❌ Error getting devices from Bridgefy, using database cache:', error);
+      try {
+        const devices = await databaseService.getAllDevices();
+        const onlineDevices = devices.filter(device =>
+          device.id !== this.myDeviceId && device.connection_status === 'online'
+        );
+        onlineDevices.forEach(device => {
+          this.connectedDevices.set(device.id, device.name);
+        });
+        return onlineDevices.map(device => ({ id: device.id, name: device.name }));
+      } catch (dbError) {
+        console.error('❌ Error getting devices from database:', dbError);
+        return Array.from(this.connectedDevices.entries()).map(([id, name]) => ({ id, name }));
+      }
     }
   }
 
@@ -403,6 +485,35 @@ class BridgefyService {
 
   setCurrentChat(deviceId) {
     this.currentChatId = deviceId;
+  }
+
+  async getMyDeviceId() {
+    try {
+      const id = await Bridgefy.getMyDeviceId();
+      if (id && id !== 'initializing...') {
+        this.myDeviceId = id;
+      }
+      return id || this.myDeviceId || 'unknown';
+    } catch (error) {
+      return this.myDeviceId || 'unknown';
+    }
+  }
+
+  async getMyDeviceName() {
+    try {
+      const name = await Bridgefy.getMyDeviceName();
+      if (name) {
+        this.myDeviceName = name;
+      }
+      return name || this.myDeviceName;
+    } catch (error) {
+      return this.myDeviceName;
+    }
+  }
+
+  setDeviceListListener(callback) {
+    this.deviceListListener = callback;
+    this.onDeviceListUpdatedHandler = callback;
   }
 
   setMessageListener(callback) {

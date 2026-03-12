@@ -20,9 +20,8 @@ class DatabaseService {
       // Open database
       this.db = await SQLite.openDatabase({
         name: 'PeerReachDB.db',
-        location: 'default',
-        createFromLocation: '~PeerReachDB.db'
-      }, 
+        location: 'default'
+      },
       () => {
         console.log('✅ Database opened successfully');
       },
@@ -106,11 +105,6 @@ class DatabaseService {
           FOREIGN KEY (device_id) REFERENCES devices(id)
         );
       `);
-
-      for (const query of queries) {
-        await this.db.executeSql(query);
-        console.log('✅ Table created/verified');
-      }
       // 4. Create indexes for performance
       await this.db.executeSql('CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp DESC);');
       await this.db.executeSql('CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id);');
