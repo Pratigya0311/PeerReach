@@ -1,13 +1,13 @@
 import React from 'react';
 import { NavigationContainer } from '@react-navigation/native';
 import { createStackNavigator } from '@react-navigation/stack';
-import HomeScreen from './src/screens/HomeScreen';
-import ChatScreen from './src/screens/ChatScreen';
-import DevicesScreen from './src/screens/DevicesScreen'; 
+import HomeScreen from '../screens/HomeScreen';
+import ChatScreen from '../screens/ChatScreen';
+import DevicesScreen from '../screens/DevicesScreen';
 
 const Stack = createStackNavigator();
 
-const App = () => {
+const AppNavigator = () => {
   return (
     <NavigationContainer>
       <Stack.Navigator
@@ -16,36 +16,31 @@ const App = () => {
           headerStyle: {
             backgroundColor: '#007AFF',
           },
-          headerTintColor: 'white',
+          headerTintColor: '#fff',
           headerTitleStyle: {
             fontWeight: 'bold',
           },
+          headerBackTitle: 'Back',
         }}
       >
-        <Stack.Screen
-          name="Home"
+        <Stack.Screen 
+          name="Home" 
           component={HomeScreen}
-          options={{
-            headerShown: false,
-          }}
+          options={{ title: 'PeerReach' }}
         />
-        <Stack.Screen
-          name="Chat"
+        <Stack.Screen 
+          name="Chat" 
           component={ChatScreen}
-          options={{
-            headerBackTitleVisible: false,
-          }}
+          options={({ route }) => ({ title: route.params.deviceName })}
         />
-        <Stack.Screen
-          name="Devices"
+        <Stack.Screen 
+          name="Devices" 
           component={DevicesScreen}
-          options={{
-            title: 'Select Device',
-          }}
+          options={{ title: 'Select Device' }}
         />
       </Stack.Navigator>
     </NavigationContainer>
   );
 };
 
-export default App;
+export default AppNavigator;

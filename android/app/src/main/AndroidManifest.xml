@@ -3,7 +3,7 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.BLUETOOTH"/>
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"/>
-    
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
     <!-- Android 12+ Bluetooth permissions -->
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
                      android:usesPermissionFlags="neverForLocation" />
@@ -22,7 +22,8 @@
       android:allowBackup="false"
       android:theme="@style/AppTheme"
       android:usesCleartextTraffic="${usesCleartextTraffic}"
-      android:supportsRtl="true">
+      android:supportsRtl="true"
+      android:requestLegacyExternalStorage="true">
       <meta-data
             android:name="com.bridgefy.sdk.API_KEY"
             android:value="8a349463-829d-4c67-a489-4a4c5cb82eba" />

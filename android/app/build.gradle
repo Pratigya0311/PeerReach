@@ -140,4 +140,5 @@ dependencies {
     //     transitive = true
     // }
     implementation 'me.bridgefy:android-sdk:1.2.3'
+    implementation project(':react-native-sqlite-storage')
 }

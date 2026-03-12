@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   View,
   Text,
@@ -8,85 +8,122 @@ import {
   StyleSheet,
   KeyboardAvoidingView,
   Platform,
+  SafeAreaView,
+  ActivityIndicator,
 } from 'react-native';
+import { useFocusEffect } from '@react-navigation/native';
 import BridgefyService from '../services/BridgefyService';
 
 const ChatScreen = ({ route, navigation }) => {
-  const { deviceId, deviceName } = route.params;
+  const { deviceId, deviceName, isBroadcast = false } = route.params;
   const [messages, setMessages] = useState([]);
   const [inputText, setInputText] = useState('');
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSending, setIsSending] = useState(false);
   const flatListRef = useRef(null);
-  const isBroadcast = deviceId === 'broadcast';
+
+  useFocusEffect(
+    useCallback(() => {
+      BridgefyService.setCurrentChat(deviceId);
+
+      BridgefyService.markAsRead(deviceId, isBroadcast);
+      
+      return () => {
+        BridgefyService.setCurrentChat(null);
+      };
+    }, [deviceId, isBroadcast])
+  );
 
   useEffect(() => {
-    console.log('ChatScreen: Opening chat with', { deviceId, deviceName, isBroadcast });
+    console.log('💬 ChatScreen opened for:', { deviceId, deviceName, isBroadcast });
+    
     navigation.setOptions({
       title: deviceName,
+      headerBackTitle: 'Back',
     });
 
-    BridgefyService.setMessageListener((incomingMessage) => {
-      console.log('ChatScreen: Received message', incomingMessage);
+    loadStoredMessages();
 
-      let isForThisChat = false;
-      
-      if (isBroadcast) {
-        isForThisChat = incomingMessage.isBroadcast === true;
-      } else {
-        const isDirectMessage = incomingMessage.isBroadcast === false;
-        const isFromThisDevice = incomingMessage.senderId === deviceId;
-        const isToThisDevice = incomingMessage.receiverId === deviceId;
-        const isMyMessage = incomingMessage.isMine === true;
-        
-        isForThisChat = isDirectMessage && 
-          (isFromThisDevice || isToThisDevice || 
-           (isMyMessage && incomingMessage.receiverId === deviceId));
-      }
-      
-      if (isForThisChat) {
-        addMessage(incomingMessage);
-      }
-    });
+    BridgefyService.setMessageListener(handleNewMessage);
 
-    if (messages.length === 0) {
-      const welcomeMessage = {
-        id: 'welcome-' + Date.now(),
-        text: isBroadcast 
-          ? 'Welcome to broadcast chat! Messages here will be sent to all nearby devices.'
-          : `You are now chatting with ${deviceName}.`,
-        senderName: 'System',
-        timestamp: Date.now(),
-        isMine: false,
-        isBroadcast: isBroadcast,
-        type: 'system'
-      };
-      addMessage(welcomeMessage);
-    }
+    BridgefyService.markAsRead(deviceId, isBroadcast);
 
     return () => {
       BridgefyService.setMessageListener(null);
     };
-  }, [deviceId, deviceName, isBroadcast]);
+  }, [deviceId, deviceName, isBroadcast, navigation]);
+
+  const loadStoredMessages = async () => {
+    try {
+      setIsLoading(true);
+      const storedMessages = await BridgefyService.getMessages(deviceId, isBroadcast, 200);
+
+      if (storedMessages.length === 0 && !isBroadcast) {
+        const welcomeMessage = {
+          id: `welcome_${Date.now()}`,
+          text: `You are now chatting with ${deviceName}. Messages are end-to-end encrypted.`,
+          senderName: 'System',
+          timestamp: Date.now(),
+          isMine: false,
+          isBroadcast: false,
+          type: 'system',
+          read: true
+        };
+        setMessages([welcomeMessage]);
+      } else {
+        setMessages([...storedMessages].reverse());
+      }
+      
+      setIsLoading(false);
+
+      setTimeout(() => {
+        if (flatListRef.current && storedMessages.length > 0) {
+          flatListRef.current.scrollToEnd({ animated: false });
+        }
+      }, 100);
+      
+    } catch (error) {
+      console.error('Error loading messages:', error);
+      setIsLoading(false);
+    }
+  };
+
+  const handleNewMessage = (message) => {
+    console.log('💬 New message in chat:', message);
+
+    const isForThisChat = isBroadcast ? 
+      message.isBroadcast === true : 
+      (!message.isBroadcast && message.senderId === deviceId);
+    
+    if (isForThisChat) {
+      addMessage(message);
+
+      message.read = true;
+    }
+  };
 
   const addMessage = (message) => {
-    setMessages((prevMessages) => {
-      if (prevMessages.some(msg => msg.id === message.id)) {
-        return prevMessages;
+    setMessages(prev => {
+      if (prev.some(m => m.id === message.id)) {
+        return prev;
       }
-      return [...prevMessages, message];
+      return [...prev, message];
     });
 
     setTimeout(() => {
-      flatListRef.current?.scrollToEnd({ animated: true });
+      if (flatListRef.current) {
+        flatListRef.current.scrollToEnd({ animated: true });
+      }
     }, 100);
   };
 
   const sendMessage = async () => {
     const text = inputText.trim();
-    if (!text) return;
+    if (!text || isSending) return;
 
-    console.log('ChatScreen: Sending message', { text, isBroadcast, deviceId });
-    
     try {
+      setIsSending(true);
+      
       let sentMessage;
       
       if (isBroadcast) {
@@ -94,20 +131,22 @@ const ChatScreen = ({ route, navigation }) => {
       } else {
         sentMessage = await BridgefyService.sendMessage(deviceId, text);
       }
-      
-      console.log('ChatScreen: Message sent successfully', sentMessage);
+
       addMessage(sentMessage);
+
       setInputText('');
+      
     } catch (error) {
-      console.error('ChatScreen: Failed to send message:', error);
-      alert(`Failed to send message: ${error.message || 'Unknown error'}`);
+      console.error('Send failed:', error);
+      alert(`Failed to send: ${error.message || 'Unknown error'}`);
+    } finally {
+      setIsSending(false);
     }
   };
 
   const renderMessage = ({ item }) => {
     const isMyMessage = item.isMine;
-    const isSystem = item.senderName === 'System';
-    const isBroadcastMsg = item.isBroadcast;
+    const isSystem = item.type === 'system';
     
     if (isSystem) {
       return (
@@ -124,22 +163,23 @@ const ChatScreen = ({ route, navigation }) => {
           isMyMessage ? styles.myMessage : styles.theirMessage,
         ]}
       >
-        {/* Sender name for received messages */}
-        {!isMyMessage && (
-          <Text style={[
-            styles.senderName,
-            isBroadcastMsg ? styles.broadcastSenderName : styles.directSenderName
-          ]}>
-            {isBroadcastMsg ? `📢 ${item.senderName}` : item.senderName}
+        {!isMyMessage && !isBroadcast && (
+          <Text style={styles.senderName}>
+            {item.senderName || 'Unknown'}
           </Text>
         )}
         
-        {/* Message bubble */}
+        {!isMyMessage && isBroadcast && (
+          <Text style={styles.broadcastSenderName}>
+            📢 {item.senderName || 'Broadcast'}
+          </Text>
+        )}
+        
         <View
           style={[
             styles.messageBubble,
             isMyMessage ? styles.myBubble : styles.theirBubble,
-            isBroadcastMsg && !isMyMessage ? styles.broadcastBubble : null
+            isBroadcast && !isMyMessage && styles.broadcastBubble,
           ]}
         >
           <Text
@@ -151,10 +191,11 @@ const ChatScreen = ({ route, navigation }) => {
             {item.text}
           </Text>
           
-          {/* Message status and timestamp */}
           <View style={styles.messageFooter}>
             {isMyMessage && (
-              <Text style={styles.messageStatus}>✓</Text>
+              <Text style={styles.messageStatus}>
+                {isSending ? '🕐' : '✓'}
+              </Text>
             )}
             <Text
               style={[
@@ -162,10 +203,7 @@ const ChatScreen = ({ route, navigation }) => {
                 isMyMessage ? styles.myTimestamp : styles.theirTimestamp,
               ]}
             >
-              {new Date(item.timestamp).toLocaleTimeString([], {
-                hour: '2-digit',
-                minute: '2-digit',
-              })}
+              {formatTime(item.timestamp)}
             </Text>
           </View>
         </View>
@@ -173,73 +211,107 @@ const ChatScreen = ({ route, navigation }) => {
     );
   };
 
+  const formatTime = (timestamp) => {
+    if (!timestamp) return '';
+    try {
+      const date = new Date(timestamp);
+      return date.toLocaleTimeString([], { 
+        hour: '2-digit', 
+        minute: '2-digit',
+        hour12: true 
+      }).toLowerCase();
+    } catch (e) {
+      return '';
+    }
+  };
+
+  if (isLoading) {
+    return (
+      <SafeAreaView style={styles.loadingContainer}>
+        <ActivityIndicator size="large" color="#007AFF" />
+        <Text style={styles.loadingText}>Loading messages...</Text>
+      </SafeAreaView>
+    );
+  }
+
   return (
     <KeyboardAvoidingView
       style={styles.container}
-      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
       keyboardVerticalOffset={Platform.OS === 'ios' ? 90 : 0}
     >
-      {/* Messages List */}
-      {messages.length === 0 ? (
-        <View style={styles.emptyState}>
-          <Text style={styles.emptyIcon}>
-            {isBroadcast ? '📢' : '💬'}
-          </Text>
-          <Text style={styles.emptyText}>
-            {isBroadcast
-              ? 'No broadcast messages yet'
-              : `Start chatting with ${deviceName}`}
-          </Text>
-          <Text style={styles.emptySubtext}>
-            {isBroadcast
-              ? 'Messages will be sent to all nearby devices'
-              : 'Your messages are end-to-end encrypted'}
-          </Text>
-        </View>
-      ) : (
+      <SafeAreaView style={styles.safeArea}>
+        {/* Messages List */}
         <FlatList
           ref={flatListRef}
           data={messages}
           renderItem={renderMessage}
-          keyExtractor={(item) => item.id || Math.random().toString()}
+          keyExtractor={(item) => item.id}
           contentContainerStyle={styles.messagesList}
           onContentSizeChange={() => {
-            if (messages.length > 0) {
-              flatListRef.current?.scrollToEnd({ animated: true });
+            if (messages.length > 0 && flatListRef.current) {
+              flatListRef.current.scrollToEnd({ animated: false });
             }
           }}
-          showsVerticalScrollIndicator={false}
-        />
-      )}
-
-      {/* Input Bar */}
-      <View style={styles.inputContainer}>
-        <TextInput
-          style={styles.input}
-          placeholder={
-            isBroadcast ? 'Type broadcast message...' : 'Type a message...'
+          onLayout={() => {
+            if (messages.length > 0 && flatListRef.current) {
+              flatListRef.current.scrollToEnd({ animated: false });
+            }
+          }}
+          showsVerticalScrollIndicator={true}
+          ListEmptyComponent={
+            <View style={styles.emptyState}>
+              <Text style={styles.emptyIcon}>
+                {isBroadcast ? '📢' : '💬'}
+              </Text>
+              <Text style={styles.emptyText}>
+                {isBroadcast 
+                  ? 'No broadcast messages yet' 
+                  : `Start chatting with ${deviceName}`}
+              </Text>
+              <Text style={styles.emptySubtext}>
+                {isBroadcast
+                  ? 'Messages will be sent to all nearby devices'
+                  : 'Your messages are end-to-end encrypted'}
+              </Text>
+            </View>
           }
-          placeholderTextColor="#999"
-          value={inputText}
-          onChangeText={setInputText}
-          multiline
-          maxLength={500}
-          onSubmitEditing={sendMessage}
-          blurOnSubmit={false}
         />
-        <TouchableOpacity
-          style={[
-            styles.sendButton,
-            !inputText.trim() && styles.sendButtonDisabled,
-          ]}
-          onPress={sendMessage}
-          disabled={!inputText.trim()}
-        >
-          <Text style={styles.sendButtonText}>
-            {isBroadcast ? '📢' : '➤'}
-          </Text>
-        </TouchableOpacity>
-      </View>
+
+        {/* Input Bar */}
+        <View style={styles.inputContainer}>
+          <TextInput
+            style={styles.input}
+            placeholder={
+              isBroadcast ? 'Type broadcast message...' : 'Type a message...'
+            }
+            placeholderTextColor="#999"
+            value={inputText}
+            onChangeText={setInputText}
+            multiline
+            maxLength={1000}
+            onSubmitEditing={sendMessage}
+            blurOnSubmit={false}
+            editable={!isSending}
+          />
+          <TouchableOpacity
+            style={[
+              styles.sendButton,
+              (!inputText.trim() || isSending) && styles.sendButtonDisabled,
+            ]}
+            onPress={sendMessage}
+            disabled={!inputText.trim() || isSending}
+          >
+            {isSending ? (
+              <ActivityIndicator size="small" color="white" />
+            ) : (
+              <Text style={styles.sendButtonText}>
+                {isBroadcast ? '📢' : '➤'}
+              </Text>
+            )}
+          </TouchableOpacity>
+        </View>
+      </SafeAreaView>
     </KeyboardAvoidingView>
   );
 };
@@ -249,11 +321,30 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#F5F5F5',
   },
+  safeArea: {
+    flex: 1,
+  },
+  loadingContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: '#F5F5F5',
+  },
+  loadingText: {
+    fontSize: 16,
+    color: '#666',
+    marginTop: 12,
+  },
+  messagesList: {
+    padding: 16,
+    paddingBottom: 8,
+    flexGrow: 1,
+  },
   emptyState: {
     flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
-    padding: 32,
+    padding: 40,
   },
   emptyIcon: {
     fontSize: 64,
@@ -272,16 +363,11 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     lineHeight: 20,
   },
-  messagesList: {
-    padding: 16,
-    paddingBottom: 8,
-  },
   systemMessage: {
     backgroundColor: '#E3F2FD',
     borderRadius: 12,
     padding: 12,
     marginVertical: 8,
-    marginHorizontal: 16,
     alignSelf: 'center',
     maxWidth: '90%',
   },
@@ -302,15 +388,16 @@ const styles = StyleSheet.create({
   },
   senderName: {
     fontSize: 12,
+    color: '#666',
     marginBottom: 4,
     marginLeft: 12,
-    fontWeight: '500',
-  },
-  directSenderName: {
-    color: '#666',
   },
   broadcastSenderName: {
+    fontSize: 12,
     color: '#FF9500',
+    fontWeight: '500',
+    marginBottom: 4,
+    marginLeft: 12,
   },
   messageBubble: {
     borderRadius: 18,
@@ -351,9 +438,9 @@ const styles = StyleSheet.create({
     marginTop: 4,
   },
   messageStatus: {
-    color: 'rgba(255,255,255,0.7)',
     fontSize: 12,
     marginRight: 4,
+    opacity: 0.7,
   },
   timestamp: {
     fontSize: 11,
