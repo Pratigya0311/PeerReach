@@ -9,6 +9,7 @@ class DatabaseService {
   constructor() {
     this.db = null;
     this.isInitialized = false;
+    this.initPromise = null;
   }
 
   async initialize() {
@@ -42,8 +43,19 @@ class DatabaseService {
     }
   }
 
+  async ensureInitialized() {
+    if (this.isInitialized) return;
+    if (!this.initPromise) {
+      this.initPromise = this.initialize().finally(() => {
+        this.initPromise = null;
+      });
+    }
+    await this.initPromise;
+  }
+
   async testDatabase() {
     try {
+      await this.ensureInitialized();
       // Simple test query
       const [results] = await this.db.executeSql('SELECT 1+1 as test');
       const testResult = results.rows.item(0).test;
@@ -122,6 +134,7 @@ class DatabaseService {
 
     async executeQuery(query, params = []) {
       try {
+      await this.ensureInitialized();
         if (!this.db) {
           throw new Error('Database not initialized');
         }
@@ -139,6 +152,7 @@ class DatabaseService {
 
   async saveDevice(device) {
     try {
+      await this.ensureInitialized();
       const { id, name, last_seen = Date.now(), connection_status = 'online' } = device;
       
       await this.db.executeSql(
@@ -156,6 +170,7 @@ class DatabaseService {
 
   async getDevice(deviceId) {
     try {
+      await this.ensureInitialized();
       const [results] = await this.db.executeSql(
         'SELECT * FROM devices WHERE id = ?;',
         [deviceId]
@@ -170,6 +185,7 @@ class DatabaseService {
 
   async getAllDevices() {
     try {
+      await this.ensureInitialized();
       const [results] = await this.db.executeSql(
         'SELECT * FROM devices ORDER BY last_seen DESC;'
       );
@@ -187,6 +203,7 @@ class DatabaseService {
 
   async updateDeviceStatus(deviceId, status) {
     try {
+      await this.ensureInitialized();
       await this.db.executeSql(
         `UPDATE devices SET connection_status = ?, last_seen = ?, updated_at = strftime('%s', 'now') 
          WHERE id = ?;`,
@@ -201,6 +218,7 @@ class DatabaseService {
 
   async deleteDevice(deviceId) {
     try {
+      await this.ensureInitialized();
       await this.db.executeSql('DELETE FROM devices WHERE id = ?;', [deviceId]);
       return true;
     } catch (error) {
@@ -213,6 +231,7 @@ class DatabaseService {
 
   async saveMessage(message) {
     try {
+      await this.ensureInitialized();
       const {
         id,
         content,
@@ -247,6 +266,7 @@ class DatabaseService {
 
   async getMessages(conversationId, messageType = 'direct', limit = 100, offset = 0) {
     try {
+      await this.ensureInitialized();
       let query, params;
 
       if (messageType === 'broadcast') {
@@ -280,6 +300,7 @@ class DatabaseService {
 
   async getUnreadCount(conversationId = null, messageType = null) {
     try {
+      await this.ensureInitialized();
       let query = 'SELECT COUNT(*) as count FROM messages WHERE read_status = 0';
       const params = [];
 
@@ -301,6 +322,7 @@ class DatabaseService {
 
   async markMessagesAsRead(conversationId, messageType = 'direct') {
     try {
+      await this.ensureInitialized();
       let query, params;
 
       if (messageType === 'broadcast') {
@@ -331,6 +353,7 @@ class DatabaseService {
 
   async deleteMessage(messageId) {
     try {
+      await this.ensureInitialized();
       await this.db.executeSql('DELETE FROM messages WHERE id = ?;', [messageId]);
       return true;
     } catch (error) {
@@ -341,6 +364,7 @@ class DatabaseService {
 
   async deleteConversation(conversationId, messageType = 'direct') {
     try {
+      await this.ensureInitialized();
       if (messageType === 'broadcast') {
         await this.db.executeSql(`DELETE FROM messages WHERE message_type = 'broadcast';`);
         await this.db.executeSql(`DELETE FROM conversations WHERE id = 'broadcast';`);
@@ -360,6 +384,7 @@ class DatabaseService {
 
   async clearAllMessages() {
     try {
+      await this.ensureInitialized();
       await this.db.executeSql('DELETE FROM messages;');
       await this.db.executeSql('DELETE FROM conversations;');
       await this.db.executeSql('DELETE FROM devices;');
@@ -374,6 +399,7 @@ class DatabaseService {
 
   async updateConversation(message) {
     try {
+      await this.ensureInitialized();
       const isBroadcast = message.message_type === 'broadcast';
       const conversationId = isBroadcast ? 'broadcast' : (message.is_mine ? message.receiver_id : message.sender_id);
       
@@ -417,6 +443,7 @@ class DatabaseService {
 
   async getConversations() {
     try {
+      await this.ensureInitialized();
       const [results] = await this.db.executeSql(
         `SELECT * FROM conversations 
          ORDER BY last_message_time DESC;`
@@ -435,6 +462,7 @@ class DatabaseService {
 
   async getConversation(conversationId) {
     try {
+      await this.ensureInitialized();
       const [results] = await this.db.executeSql(
         'SELECT * FROM conversations WHERE id = ?;',
         [conversationId]
@@ -482,6 +510,7 @@ class DatabaseService {
 
   async getMessageCount() {
     try {
+      await this.ensureInitialized();
       const [results] = await this.db.executeSql('SELECT COUNT(*) as count FROM messages;');
       return results.rows.item(0).count;
     } catch (error) {
@@ -492,6 +521,7 @@ class DatabaseService {
 
   async getDatabaseSize() {
     try {
+      await this.ensureInitialized();
       const [results] = await this.db.executeSql(
         "SELECT page_count * page_size as size FROM pragma_page_count(), pragma_page_size();"
       );
@@ -504,6 +534,7 @@ class DatabaseService {
 
   async backupDatabase() {
     try {
+      await this.ensureInitialized();
       const timestamp = Date.now();
       const backupName = `PeerReachDB_backup_${timestamp}.db`;
       

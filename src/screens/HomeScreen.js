@@ -106,7 +106,7 @@ const HomeScreen = ({ navigation }) => {
       setBridgefyStatus('initializing');
       console.log('🚀 Initializing Bridgefy...');
       
-      const API_KEY = '8a349463-829d-4c67-a489-4a4c5cb82eba';
+      const API_KEY = 'e33f9719-66d1-4d19-acd0-3fb186c915a3';
       
       if (!API_KEY || API_KEY.length < 36) {
         Alert.alert('Invalid API Key', 'Please check your Bridgefy API key configuration.');
