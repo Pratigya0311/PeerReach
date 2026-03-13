@@ -71,7 +71,7 @@ const ChatScreen = ({ route, navigation }) => {
         };
         setMessages([welcomeMessage]);
       } else {
-        setMessages([...storedMessages].reverse());
+        setMessages(storedMessages);
       }
       
       setIsLoading(false);

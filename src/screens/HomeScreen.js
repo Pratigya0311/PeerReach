@@ -83,6 +83,7 @@ const HomeScreen = ({ navigation }) => {
           return (
             result['android.permission.BLUETOOTH_CONNECT'] === 'granted' &&
             result['android.permission.BLUETOOTH_SCAN'] === 'granted' &&
+            result['android.permission.BLUETOOTH_ADVERTISE'] === 'granted' &&
             result['android.permission.ACCESS_FINE_LOCATION'] === 'granted'
           );
         } 
@@ -241,7 +242,7 @@ const HomeScreen = ({ navigation }) => {
             ]} 
             numberOfLines={2}
           >
-            {item.isBroadcast ? `📢 ${item.senderName}: ` : ''}{item.lastMessage}
+            {item.isBroadcast ? `${item.senderName}: ` : ''}{item.lastMessage}
           </Text>
         </View>
       </TouchableOpacity>
