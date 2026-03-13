@@ -248,7 +248,7 @@ class DatabaseService {
 
       // Save message
       await this.db.executeSql(
-        `INSERT INTO messages 
+        `INSERT OR IGNORE INTO messages 
          (id, content, sender_id, sender_name, receiver_id, message_type, is_mine, is_broadcast, timestamp, read_status, delivery_status) 
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
         [id, content, sender_id, sender_name, receiver_id, message_type, is_mine ? 1 : 0, is_broadcast ? 1 : 0, timestamp, read_status ? 1 : 0, delivery_status]
