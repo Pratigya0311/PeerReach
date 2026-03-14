@@ -117,7 +117,16 @@ class DatabaseService {
           FOREIGN KEY (device_id) REFERENCES devices(id)
         );
       `);
-      // 4. Create indexes for performance
+      // 4. Gateway cache table
+      await this.db.executeSql(`
+        CREATE TABLE IF NOT EXISTS gateway_cache (
+          query TEXT PRIMARY KEY,
+          result TEXT NOT NULL,
+          timestamp INTEGER NOT NULL
+        );
+      `);
+
+      // 5. Create indexes for performance
       await this.db.executeSql('CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp DESC);');
       await this.db.executeSql('CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id);');
       await this.db.executeSql('CREATE INDEX IF NOT EXISTS idx_messages_receiver ON messages(receiver_id);');

@@ -213,9 +213,9 @@ const HomeScreen = ({ navigation }) => {
         ]}
         onPress={() => openChat(item)}
       >
-        <View style={styles.avatar}>
+        <View style={[styles.avatar, item.isBroadcast ? styles.avatarBroadcast : styles.avatarDirect]}>
           <Text style={styles.avatarText}>
-            {item.isBroadcast ? '📢' : '💬'}
+            {item.isBroadcast ? 'BC' : (item.name || '?')[0].toUpperCase()}
           </Text>
           {item.unreadCount > 0 && (
             <View style={styles.avatarBadge}>
@@ -241,7 +241,7 @@ const HomeScreen = ({ navigation }) => {
             ]} 
             numberOfLines={2}
           >
-            {item.isBroadcast ? `📢 ${item.senderName}: ` : ''}{item.lastMessage}
+            {item.isBroadcast ? `${item.senderName}: ` : ''}{item.lastMessage}
           </Text>
         </View>
       </TouchableOpacity>
@@ -283,7 +283,7 @@ const HomeScreen = ({ navigation }) => {
       {/* Header */}
       <View style={styles.header}>
         <View style={styles.headerTop}>
-          <Text style={styles.title}>🔗 PeerReach</Text>
+          <Text style={styles.title}>PeerReach</Text>
           {unreadCounts.total > 0 && (
             <View style={styles.headerBadge}>
               <Text style={styles.headerBadgeText}>{unreadCounts.total}</Text>
@@ -295,10 +295,13 @@ const HomeScreen = ({ navigation }) => {
           {myDeviceName} • ID: {myDeviceId ? myDeviceId.substring(0, 8) + '...' : 'Unknown'}
         </Text>
         
-        <Text style={styles.status}>
-          {bridgefyStatus === 'ready' ? '✅ Online' : '⚠️ Offline'}
-          {conversations.length > 0 && ` • ${conversations.length} conversation${conversations.length !== 1 ? 's' : ''}`}
-        </Text>
+        <View style={styles.statusRow}>
+          <View style={[styles.statusDot, bridgefyStatus === 'ready' ? styles.dotOnline : styles.dotOffline]} />
+          <Text style={styles.status}>
+            {bridgefyStatus === 'ready' ? 'Online' : 'Offline'}
+            {conversations.length > 0 && ` • ${conversations.length} conversation${conversations.length !== 1 ? 's' : ''}`}
+          </Text>
+        </View>
       </View>
 
       {/* Action Buttons */}
@@ -307,13 +310,13 @@ const HomeScreen = ({ navigation }) => {
           style={[styles.actionButton, styles.broadcastButton]}
           onPress={() => openChat({
             id: 'broadcast',
-            name: '📢 Broadcast to All',
+            name: 'Broadcast to All',
             isBroadcast: true,
             timestamp: Date.now(),
             lastMessage: 'Send messages to all nearby devices'
           })}
         >
-          <Text style={styles.actionButtonText}>📢 Broadcast</Text>
+          <Text style={styles.actionButtonText}>Broadcast</Text>
         </TouchableOpacity>
         
         <TouchableOpacity
@@ -321,6 +324,13 @@ const HomeScreen = ({ navigation }) => {
           onPress={openNewChat}
         >
           <Text style={styles.actionButtonText}>+ New Chat</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[styles.actionButton, styles.askMeshButton]}
+          onPress={() => navigation.navigate('MeshQuery')}
+        >
+          <Text style={styles.actionButtonText}>Ask Mesh</Text>
         </TouchableOpacity>
       </View>
 
@@ -339,7 +349,7 @@ const HomeScreen = ({ navigation }) => {
         }
         ListEmptyComponent={
           <View style={styles.emptyState}>
-            <Text style={styles.emptyIcon}>💬</Text>
+            <View style={styles.emptyIconCircle} />
             <Text style={styles.emptyText}>No conversations yet</Text>
             <Text style={styles.emptySubtext}>
               Start a broadcast or chat with nearby devices
@@ -417,6 +427,18 @@ const styles = StyleSheet.create({
     color: 'rgba(255,255,255,0.9)',
     marginBottom: 4,
   },
+  statusRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  statusDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    marginRight: 6,
+  },
+  dotOnline: { backgroundColor: '#34C759' },
+  dotOffline: { backgroundColor: '#FF3B30' },
   status: {
     fontSize: 12,
     color: 'rgba(255,255,255,0.7)',
@@ -440,6 +462,9 @@ const styles = StyleSheet.create({
   },
   newChatButton: {
     backgroundColor: '#34C759',
+  },
+  askMeshButton: {
+    backgroundColor: '#5856D6',
   },
   actionButtonText: {
     color: 'white',
@@ -472,14 +497,17 @@ const styles = StyleSheet.create({
     width: 50,
     height: 50,
     borderRadius: 25,
-    backgroundColor: '#E3F2FD',
     justifyContent: 'center',
     alignItems: 'center',
     marginRight: 12,
     position: 'relative',
   },
+  avatarBroadcast: { backgroundColor: '#FF9500' },
+  avatarDirect:    { backgroundColor: '#007AFF' },
   avatarText: {
-    fontSize: 24,
+    fontSize: 16,
+    fontWeight: '700',
+    color: 'white',
   },
   avatarBadge: {
     position: 'absolute',
@@ -533,8 +561,11 @@ const styles = StyleSheet.create({
     padding: 40,
     marginTop: 60,
   },
-  emptyIcon: {
-    fontSize: 64,
+  emptyIconCircle: {
+    width: 64,
+    height: 64,
+    borderRadius: 32,
+    backgroundColor: '#E0E0E0',
     marginBottom: 16,
   },
   emptyText: {

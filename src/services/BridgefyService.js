@@ -1,7 +1,8 @@
-// src/services/BridgefyService.js - UPDATED FOR SQLITE
+// src/services/BridgefyService.js - UPDATED FOR SQLITE + GATEWAY
 import { NativeModules, NativeEventEmitter, Platform, AppState } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import databaseService from './DatabaseService';
+import gatewayService from './GatewayService';
 
 const { Bridgefy } = NativeModules;
 const bridgefyEmitter = new NativeEventEmitter(Bridgefy);
@@ -19,7 +20,10 @@ class BridgefyService {
     this.useAsyncStorage = false;
     // Initialize database
     this.initializeDatabase();
-    
+
+    // Wire up gateway service
+    gatewayService.init(this);
+
     // Set up event listeners
     this.setupEventListeners();
     
@@ -45,6 +49,7 @@ class BridgefyService {
       this.myDeviceId = data.userUuid;
       this.myDeviceName = data.deviceName || this.myDeviceName;
       this.isInitialized = true;
+      gatewayService.setMyDeviceId(this.myDeviceId);
       
       // Save my own device to database
       await databaseService.saveDevice({
@@ -148,6 +153,23 @@ class BridgefyService {
 
   async handleIncomingMessage(rawMessage, isBroadcast) {
     try {
+      // Intercept gateway protocol messages — don't save to chat DB
+      if (rawMessage.content) {
+        try {
+          const parsed = JSON.parse(rawMessage.content);
+          if (
+            parsed.type === 'internet_request' ||
+            parsed.type === 'internet_response' ||
+            parsed.type === 'cache_share'
+          ) {
+            await gatewayService.handleIncomingGatewayMessage(parsed, rawMessage.senderId);
+            return;
+          }
+        } catch {
+          // Not JSON — treat as regular chat message below
+        }
+      }
+
       const messageType = isBroadcast ? 'broadcast' : 'direct';
       const senderId = rawMessage.senderId || 'unknown';
       const senderName = rawMessage.senderName || this.connectedDevices.get(senderId) || 'Unknown Device';
@@ -292,6 +314,21 @@ class BridgefyService {
 
   async sendBroadcast(text) {
     try {
+      // Gateway protocol messages: send over BLE but never save to chat DB
+      try {
+        const parsed = JSON.parse(text);
+        if (
+          parsed.type === 'internet_request' ||
+          parsed.type === 'internet_response' ||
+          parsed.type === 'cache_share'
+        ) {
+          await Bridgefy.sendBroadcast(text);
+          return { id: null };
+        }
+      } catch (_e) {
+        // Not JSON — regular chat broadcast, fall through
+      }
+
       console.log(`📢 Broadcasting: ${text}`);
       const response = await Bridgefy.sendBroadcast(text);
       
