@@ -18,6 +18,7 @@ class BridgefyModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
 
     private var bridgefy: Bridgefy? = null
     private var currentUserId: UUID? = null
+    private var isStarting: Boolean = false
     private var deviceName: String = "Unknown Device"
     private var connectedDevices = mutableMapOf<UUID, String>()
 
@@ -148,6 +149,7 @@ class BridgefyModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
         override fun onStarted(deviceUUID: UUID) {
             Log.i("BridgefyModule", "Bridgefy started with ID: $deviceUUID")
             currentUserId = deviceUUID
+            isStarting = false
             
             // Get device name from build
             deviceName = android.os.Build.MODEL
@@ -160,6 +162,7 @@ class BridgefyModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
 
         override fun onFailToStart(error: BridgefyException) {
             Log.e("BridgefyModule", "Failed to start: ${error.message}")
+            isStarting = false
             
             val params = Arguments.createMap()
             params.putString("message", error.message)
@@ -170,6 +173,7 @@ class BridgefyModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
             Log.i("BridgefyModule", "Bridgefy stopped")
             connectedDevices.clear()
             currentUserId = null
+            isStarting = false
             sendEvent("onStopped", null)
         }
 
@@ -222,6 +226,17 @@ class BridgefyModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
     @ReactMethod
     fun initialize(apiKey: String) {
         try {
+            if (currentUserId != null) {
+                val params = Arguments.createMap()
+                params.putString("userUuid", currentUserId.toString())
+                params.putString("deviceName", deviceName)
+                sendEvent("onRegistrationSuccessful", params)
+                return
+            }
+            if (isStarting) {
+                return
+            }
+            isStarting = true
             Log.i("BridgefyModule", "Initializing with API key: $apiKey")
             
             // Get device name

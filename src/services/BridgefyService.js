@@ -16,6 +16,7 @@ class BridgefyService {
     this.myDeviceId = null;
     this.myDeviceName = Platform.OS === 'android' ? Bridgefy.deviceName || 'Android Device' : 'iOS Device';
     this.isInitialized = false;
+    this.isInitializing = false;
     this.currentChatId = null;
     this.useAsyncStorage = false;
     // Initialize database
@@ -260,13 +261,19 @@ class BridgefyService {
   // ============ PUBLIC API ============
 
   async initialize(apiKey) {
-    console.log('🚀 Initializing Bridgefy with SQLite...');
+    console.log('Initializing Bridgefy with SQLite...');
     try {
+      if (this.isInitialized || this.isInitializing) {
+        return true;
+      }
+      this.isInitializing = true;
       await Bridgefy.initialize(apiKey);
       return true;
     } catch (error) {
-      console.error('❌ Bridgefy initialization failed:', error);
+      console.error('Bridgefy initialization failed:', error);
       throw error;
+    } finally {
+      this.isInitializing = false;
     }
   }
 
@@ -594,3 +601,5 @@ class BridgefyService {
 
 // Export singleton instance
 export default new BridgefyService();
+
+
