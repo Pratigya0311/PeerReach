@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ipconfig /all)",
+      "Bash(cmd /c 'ipconfig /all')",
+      "Bash(powershell.exe -Command \"Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_IPAddress -like ''192.168.137*''}\")",
+      "Bash(adb exec-out:*)",
+      "Bash(\"C:/Users/Sadhana/Desktop/wifi2.png\")",
+      "Bash(\"C:/Users/Sadhana/Desktop/home_screen.png\")",
+      "Bash(adb pull:*)",
+      "Bash(for file:*)",
+      "Bash(do echo:*)",
+      "Read(//c/Users/Sadhana/Projects/BridgifyApp/PeerReach/android/**)",
+      "Bash(done)",
+      "Bash(tasklist /FI 'IMAGENAME eq node.exe')",
+      "Bash(taskkill /PID 32196 /F)",
+      "Bash(taskkill /PID 32196 /F /T)",
+      "Bash(curl -s http://localhost:8081/status)",
+      "Bash(curl -s \"http://localhost:8081/index.bundle?platform=android&dev=true&minify=false\")"
+    ]
+  }
+}

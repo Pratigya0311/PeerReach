@@ -1,5 +1,5 @@
 // src/screens/MeshQueryScreen.js
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import {
   View,
   Text,
@@ -8,49 +8,54 @@ import {
   ScrollView,
   StyleSheet,
   ActivityIndicator,
-  SafeAreaView,
   KeyboardAvoidingView,
   Platform,
   Alert,
 } from 'react-native';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useHeaderHeight } from '@react-navigation/elements';
 import gatewayService from '../services/GatewayService';
+import { useTheme } from '../theme';
 
 const STATUS = {
-  IDLE: 'idle',
-  CHECKING: 'checking',
-  SEARCHING: 'searching',
+  IDLE:         'idle',
+  CHECKING:     'checking',
+  SEARCHING:    'searching',
   WAITING_MESH: 'waiting_mesh',
-  DONE: 'done',
-  ERROR: 'error',
+  DONE:         'done',
+  ERROR:        'error',
 };
 
 const MeshQueryScreen = ({ navigation }) => {
-  const [query, setQuery] = useState('');
-  const [status, setStatus] = useState(STATUS.IDLE);
-  const [results, setResults] = useState([]);  // list of { query, result, source, timestamp }
-  const [isGateway, setIsGateway] = useState(false);
+  const colors = useTheme();
+  const styles = useMemo(() => makeStyles(colors), [colors]);
+  const insets = useSafeAreaInsets();
+  const headerHeight = useHeaderHeight();
+
+  const [query, setQuery]             = useState('');
+  const [status, setStatus]           = useState(STATUS.IDLE);
+  const [results, setResults]         = useState([]);
+  const [isGateway, setIsGateway]     = useState(false);
   const [pendingCount, setPendingCount] = useState(0);
   const inputRef = useRef(null);
 
   useEffect(() => {
     navigation.setOptions({ title: 'Ask the Mesh' });
 
-    // Check if this device is a gateway
-    gatewayService.checkInternet().then(setIsGateway);
+    gatewayService.checkInternet()
+      .then(setIsGateway)
+      .catch(err => { console.error('Failed to check internet:', err); setIsGateway(false); });
 
-    // Load cache history to show previous results
-    gatewayService.getCacheHistory().then(history => {
-      const items = history.map(h => ({
-        query: h.query,
-        result: h.result,
-        source: 'cache',
-        timestamp: h.timestamp,
-      }));
-      setResults(items);
-    });
+    gatewayService.getCacheHistory()
+      .then(history => {
+        setResults(history.map(h => ({
+          query: h.query, result: h.result,
+          source: 'cache', timestamp: h.timestamp,
+        })));
+      })
+      .catch(err => console.error('Failed to load cache history:', err));
 
-    // Register callback for delayed mesh responses (store-and-forward delivery)
-    gatewayService.setOnQueryResultCallback(({ request_id, result, query: q, delayed }) => {
+    gatewayService.setOnQueryResultCallback(({ result, query: q, delayed }) => {
       if (delayed) {
         setResults(prev => [
           { query: q, result, source: 'mesh (delayed)', timestamp: Date.now() },
@@ -65,9 +70,7 @@ const MeshQueryScreen = ({ navigation }) => {
       }
     });
 
-    return () => {
-      gatewayService.setOnQueryResultCallback(null);
-    };
+    return () => { gatewayService.setOnQueryResultCallback(null); };
   }, [navigation]);
 
   const handleSend = async () => {
@@ -75,32 +78,23 @@ const MeshQueryScreen = ({ navigation }) => {
     if (!q || status === STATUS.SEARCHING || status === STATUS.WAITING_MESH) return;
 
     setStatus(STATUS.CHECKING);
-
     try {
-      // onStatus fires once checkInternet() resolves inside sendQuery — avoids a double check
       const { result, source } = await gatewayService.sendQuery(q, (hasInternet) => {
         setIsGateway(hasInternet);
         setStatus(hasInternet ? STATUS.SEARCHING : STATUS.WAITING_MESH);
       });
-
-      setResults(prev => [
-        { query: q, result, source, timestamp: Date.now() },
-        ...prev,
-      ]);
+      setResults(prev => [{ query: q, result, source, timestamp: Date.now() }, ...prev]);
       setQuery('');
       setStatus(STATUS.DONE);
     } catch (err) {
       if (err.message === 'NO_GATEWAY_NEARBY') {
         setPendingCount(gatewayService.getPendingQueueCount());
-        setResults(prev => [
-          {
-            query: q,
-            result: 'No gateway found nearby. Your request has been queued and will be answered automatically when a device with internet comes into range.',
-            source: 'queued',
-            timestamp: Date.now(),
-          },
-          ...prev,
-        ]);
+        setResults(prev => [{
+          query: q,
+          result: 'No gateway found nearby. Your request has been queued and will be answered automatically when a device with internet comes into range.',
+          source: 'queued',
+          timestamp: Date.now(),
+        }, ...prev]);
         setQuery('');
         setStatus(STATUS.DONE);
       } else {
@@ -112,23 +106,22 @@ const MeshQueryScreen = ({ navigation }) => {
 
   const getStatusText = () => {
     switch (status) {
-      case STATUS.CHECKING:      return 'Checking connectivity...';
-      case STATUS.SEARCHING:     return 'Searching the internet...';
-      case STATUS.WAITING_MESH:  return 'Broadcasting through mesh... waiting for a gateway...';
-      case STATUS.DONE:          return '';
-      case STATUS.ERROR:         return 'Something went wrong';
-      default:                   return '';
+      case STATUS.CHECKING:     return 'Checking connectivity...';
+      case STATUS.SEARCHING:    return 'Searching the internet...';
+      case STATUS.WAITING_MESH: return 'Broadcasting through mesh... waiting for a gateway...';
+      case STATUS.ERROR:        return 'Something went wrong';
+      default:                  return '';
     }
   };
 
   const getSourceBadge = (source) => {
     switch (source) {
-      case 'internet': return { label: 'Internet', color: '#34C759' };
-      case 'cache':    return { label: 'Cached',   color: '#007AFF' };
-      case 'mesh':     return { label: 'Via Mesh', color: '#FF9500' };
-      case 'mesh (delayed)': return { label: 'Mesh (delayed)', color: '#FF9500' };
-      case 'queued':   return { label: 'Queued',   color: '#999' };
-      default:         return { label: source,     color: '#666' };
+      case 'internet':       return { label: 'Internet',       color: colors.success };
+      case 'cache':          return { label: 'Cached',         color: colors.primary };
+      case 'mesh':           return { label: 'Via Mesh',       color: colors.warning };
+      case 'mesh (delayed)': return { label: 'Mesh (delayed)', color: colors.warning };
+      case 'queued':         return { label: 'Queued',         color: colors.textMuted };
+      default:               return { label: source,           color: colors.textMuted };
     }
   };
 
@@ -140,10 +133,10 @@ const MeshQueryScreen = ({ navigation }) => {
   return (
     <KeyboardAvoidingView
       style={styles.container}
-      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-      keyboardVerticalOffset={Platform.OS === 'ios' ? 90 : 0}
+      behavior="padding"
+      keyboardVerticalOffset={headerHeight}
     >
-      <SafeAreaView style={styles.safe}>
+      <SafeAreaView style={styles.safe} edges={['top']}>
         {/* Status bar */}
         <View style={[styles.statusBar, isGateway ? styles.statusBarGateway : styles.statusBarRelay]}>
           <View style={styles.statusBarLeft}>
@@ -165,7 +158,7 @@ const MeshQueryScreen = ({ navigation }) => {
         >
           {isLoading && (
             <View style={styles.loadingCard}>
-              <ActivityIndicator size="small" color="#007AFF" />
+              <ActivityIndicator size="small" color={colors.primary} />
               <Text style={styles.loadingText}>{getStatusText()}</Text>
             </View>
           )}
@@ -182,7 +175,7 @@ const MeshQueryScreen = ({ navigation }) => {
               <Text style={styles.exampleLabel}>Example queries:</Text>
               {['capital of france', 'weather bangalore', 'speed of light', 'what is bitcoin'].map(ex => (
                 <TouchableOpacity key={ex} onPress={() => setQuery(ex)}>
-                  <Text style={styles.exampleItem}>· {ex}</Text>
+                  <Text style={styles.exampleItem}>- {ex}</Text>
                 </TouchableOpacity>
               ))}
             </View>
@@ -210,12 +203,12 @@ const MeshQueryScreen = ({ navigation }) => {
         </ScrollView>
 
         {/* Input bar */}
-        <View style={styles.inputBar}>
+        <View style={[styles.inputBar, { paddingBottom: Math.max(insets.bottom, 8) }]}>
           <TextInput
             ref={inputRef}
             style={styles.input}
             placeholder="Ask anything..."
-            placeholderTextColor="#999"
+            placeholderTextColor={colors.placeholder}
             value={query}
             onChangeText={setQuery}
             onSubmitEditing={handleSend}
@@ -229,7 +222,7 @@ const MeshQueryScreen = ({ navigation }) => {
             disabled={!query.trim() || isLoading}
           >
             {isLoading
-              ? <ActivityIndicator size="small" color="white" />
+              ? <ActivityIndicator size="small" color={colors.onColor} />
               : <Text style={styles.sendBtnText}>Ask</Text>
             }
           </TouchableOpacity>
@@ -239,128 +232,84 @@ const MeshQueryScreen = ({ navigation }) => {
   );
 };
 
-const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#F5F5F5' },
-  safe: { flex: 1 },
+// ─── Styles (theme-aware) ────────────────────────────────────────────────────
+const makeStyles = (colors) => StyleSheet.create({
+  container: { flex: 1, backgroundColor: colors.background },
+  safe:      { flex: 1 },
 
   statusBar: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingVertical: 8,
+    flexDirection: 'row', justifyContent: 'space-between',
+    alignItems: 'center', paddingHorizontal: 16, paddingVertical: 8,
   },
-  statusBarGateway: { backgroundColor: '#D4EDDA' },
-  statusBarRelay:   { backgroundColor: '#FFF3CD' },
-  statusBarLeft: { flexDirection: 'row', alignItems: 'center' },
-  statusDot: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-    marginRight: 8,
-  },
-  dotGateway: { backgroundColor: '#34C759' },
-  dotRelay:   { backgroundColor: '#FF9500' },
-  statusBarText: { fontSize: 13, fontWeight: '500', color: '#333' },
-  pendingText: { fontSize: 12, color: '#FF9500', fontWeight: '600' },
+  statusBarGateway: { backgroundColor: colors.statusBarGateway },
+  statusBarRelay:   { backgroundColor: colors.statusBarRelay },
+  statusBarLeft:    { flexDirection: 'row', alignItems: 'center' },
+  statusDot:        { width: 8, height: 8, borderRadius: 4, marginRight: 8 },
+  dotGateway:       { backgroundColor: colors.success },
+  dotRelay:         { backgroundColor: colors.warning },
+  statusBarText:    { fontSize: 13, fontWeight: '500', color: colors.statusBarText },
+  pendingText:      { fontSize: 12, color: colors.warning, fontWeight: '600' },
 
-  results: { flex: 1 },
+  results:        { flex: 1 },
   resultsContent: { padding: 16, paddingBottom: 8 },
 
   loadingCard: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: 'white',
-    borderRadius: 12,
-    padding: 16,
-    marginBottom: 12,
-    gap: 10,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.08,
-    shadowRadius: 3,
-    elevation: 2,
+    flexDirection: 'row', alignItems: 'center',
+    backgroundColor: colors.surface,
+    borderRadius: 12, padding: 16, marginBottom: 12, gap: 10,
+    shadowColor: '#000', shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.08, shadowRadius: 3, elevation: 2,
   },
-  loadingText: { fontSize: 14, color: '#555', flex: 1 },
+  loadingText: { fontSize: 14, color: colors.textSecondary, flex: 1 },
 
-  emptyState: { alignItems: 'center', paddingVertical: 40 },
+  emptyState:    { alignItems: 'center', paddingVertical: 40 },
   emptyIconCircle: {
-    width: 56,
-    height: 56,
-    borderRadius: 28,
-    backgroundColor: '#E0E0E0',
-    marginBottom: 12,
+    width: 56, height: 56, borderRadius: 28,
+    backgroundColor: colors.emptyCircle, marginBottom: 12,
   },
-  emptyTitle: { fontSize: 20, fontWeight: '700', color: '#333', marginBottom: 8 },
+  emptyTitle: { fontSize: 20, fontWeight: '700', color: colors.text, marginBottom: 8 },
   emptySubtitle: {
-    fontSize: 14, color: '#777', textAlign: 'center',
+    fontSize: 14, color: colors.textMuted, textAlign: 'center',
     lineHeight: 20, marginBottom: 24, paddingHorizontal: 20,
   },
-  exampleLabel: { fontSize: 13, color: '#999', marginBottom: 8, fontWeight: '600' },
-  exampleItem:  { fontSize: 14, color: '#007AFF', marginBottom: 6 },
+  exampleLabel: { fontSize: 13, color: colors.textMuted, marginBottom: 8, fontWeight: '600' },
+  exampleItem:  { fontSize: 14, color: colors.primary, marginBottom: 6 },
 
   resultCard: {
-    backgroundColor: 'white',
-    borderRadius: 12,
-    padding: 16,
-    marginBottom: 12,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.08,
-    shadowRadius: 3,
-    elevation: 2,
+    backgroundColor: colors.surface,
+    borderRadius: 12, padding: 16, marginBottom: 12,
+    shadowColor: '#000', shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.08, shadowRadius: 3, elevation: 2,
   },
   resultHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'flex-start',
-    marginBottom: 8,
+    flexDirection: 'row', justifyContent: 'space-between',
+    alignItems: 'flex-start', marginBottom: 8,
   },
-  resultQuery: {
-    fontSize: 14,
-    fontWeight: '700',
-    color: '#333',
-    flex: 1,
-    marginRight: 8,
-  },
-  sourceBadge: {
-    borderRadius: 8,
-    paddingHorizontal: 8,
-    paddingVertical: 3,
-  },
-  sourceBadgeText: { color: 'white', fontSize: 11, fontWeight: '600' },
-  resultText: { fontSize: 15, color: '#444', lineHeight: 22 },
-  resultTime: { fontSize: 11, color: '#aaa', marginTop: 8, textAlign: 'right' },
+  resultQuery: { fontSize: 14, fontWeight: '700', color: colors.text, flex: 1, marginRight: 8 },
+  sourceBadge: { borderRadius: 8, paddingHorizontal: 8, paddingVertical: 3 },
+  sourceBadgeText: { color: colors.onColor, fontSize: 11, fontWeight: '600' },
+  resultText: { fontSize: 15, color: colors.textSecondary, lineHeight: 22 },
+  resultTime: { fontSize: 11, color: colors.textMuted, marginTop: 8, textAlign: 'right' },
 
   inputBar: {
-    flexDirection: 'row',
-    padding: 12,
-    backgroundColor: 'white',
-    borderTopWidth: 1,
-    borderTopColor: '#E0E0E0',
+    flexDirection: 'row', padding: 12,
+    backgroundColor: colors.surface,
+    borderTopWidth: 1, borderTopColor: colors.border,
     alignItems: 'center',
   },
   input: {
-    flex: 1,
-    backgroundColor: '#F5F5F5',
-    borderRadius: 20,
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    fontSize: 15,
-    marginRight: 8,
-    minHeight: 40,
+    flex: 1, backgroundColor: colors.surfaceVariant,
+    borderRadius: 20, paddingHorizontal: 16, paddingVertical: 10,
+    fontSize: 15, marginRight: 8, minHeight: 40,
+    color: colors.text,
   },
   sendBtn: {
-    backgroundColor: '#007AFF',
-    borderRadius: 20,
-    paddingHorizontal: 20,
-    paddingVertical: 10,
-    minWidth: 56,
-    alignItems: 'center',
-    justifyContent: 'center',
+    backgroundColor: colors.primary,
+    borderRadius: 20, paddingHorizontal: 20, paddingVertical: 10,
+    minWidth: 56, alignItems: 'center', justifyContent: 'center',
   },
-  sendBtnDisabled: { backgroundColor: '#CCC' },
-  sendBtnText: { color: 'white', fontWeight: '700', fontSize: 15 },
+  sendBtnDisabled: { backgroundColor: colors.border },
+  sendBtnText:     { color: colors.onColor, fontWeight: '700', fontSize: 15 },
 });
 
 export default MeshQueryScreen;

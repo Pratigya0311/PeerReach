@@ -53,19 +53,6 @@ class DatabaseService {
     await this.initPromise;
   }
 
-  async testDatabase() {
-    try {
-      await this.ensureInitialized();
-      // Simple test query
-      const [results] = await this.db.executeSql('SELECT 1+1 as test');
-      const testResult = results.rows.item(0).test;
-      console.log('✅ Database test passed:', testResult === 2);
-    } catch (error) {
-      console.error('❌ Database test failed:', error);
-      throw error;
-    }
-  }
-
   async createTables() {
     try {
       // 1. Devices table
@@ -126,7 +113,18 @@ class DatabaseService {
         );
       `);
 
-      // 5. Create indexes for performance
+      // 5. Migrate: add is_pinned, reply columns (safe — no-op if already exists)
+      try {
+        await this.db.executeSql('ALTER TABLE messages ADD COLUMN is_pinned INTEGER DEFAULT 0;');
+      } catch (_e) { /* column already exists */ }
+      try {
+        await this.db.executeSql('ALTER TABLE messages ADD COLUMN reply_to_id TEXT;');
+      } catch (_e) { /* column already exists */ }
+      try {
+        await this.db.executeSql('ALTER TABLE messages ADD COLUMN reply_preview TEXT;');
+      } catch (_e) { /* column already exists */ }
+
+      // 6. Create indexes for performance
       await this.db.executeSql('CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp DESC);');
       await this.db.executeSql('CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id);');
       await this.db.executeSql('CREATE INDEX IF NOT EXISTS idx_messages_receiver ON messages(receiver_id);');
@@ -185,7 +183,8 @@ class DatabaseService {
         [deviceId]
       );
       
-      return results.rows.item(0) || null;
+      if (!results || !results.rows || results.rows.length === 0) return null;
+      return results.rows.item(0);
     } catch (error) {
       console.error('❌ Error getting device:', error);
       throw error;
@@ -225,17 +224,6 @@ class DatabaseService {
     }
   }
 
-  async deleteDevice(deviceId) {
-    try {
-      await this.ensureInitialized();
-      await this.db.executeSql('DELETE FROM devices WHERE id = ?;', [deviceId]);
-      return true;
-    } catch (error) {
-      console.error('❌ Error deleting device:', error);
-      throw error;
-    }
-  }
-
   // ============ MESSAGE OPERATIONS ============
 
   async saveMessage(message) {
@@ -252,15 +240,17 @@ class DatabaseService {
         is_broadcast = 0,
         timestamp = Date.now(),
         read_status = 0,
-        delivery_status = 'sent'
+        delivery_status = 'sent',
+        reply_to_id = null,
+        reply_preview = null,
       } = message;
 
       // Save message
       await this.db.executeSql(
-        `INSERT OR IGNORE INTO messages 
-         (id, content, sender_id, sender_name, receiver_id, message_type, is_mine, is_broadcast, timestamp, read_status, delivery_status) 
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
-        [id, content, sender_id, sender_name, receiver_id, message_type, is_mine ? 1 : 0, is_broadcast ? 1 : 0, timestamp, read_status ? 1 : 0, delivery_status]
+        `INSERT OR IGNORE INTO messages
+         (id, content, sender_id, sender_name, receiver_id, message_type, is_mine, is_broadcast, timestamp, read_status, delivery_status, reply_to_id, reply_preview)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
+        [id, content, sender_id, sender_name, receiver_id, message_type, is_mine ? 1 : 0, is_broadcast ? 1 : 0, timestamp, read_status ? 1 : 0, delivery_status, reply_to_id, reply_preview]
       );
 
       // Update conversation
@@ -360,6 +350,29 @@ class DatabaseService {
     }
   }
 
+  async searchMessages(query, limit = 50) {
+    try {
+      await this.ensureInitialized();
+      const term = `%${query}%`;
+      const [results] = await this.db.executeSql(
+        `SELECT * FROM messages
+         WHERE content LIKE ?
+         AND message_type IN ('direct', 'broadcast')
+         ORDER BY timestamp DESC
+         LIMIT ?`,
+        [term, limit]
+      );
+      const messages = [];
+      for (let i = 0; i < results.rows.length; i++) {
+        messages.push(this.normalizeMessage(results.rows.item(i)));
+      }
+      return messages;
+    } catch (error) {
+      console.error('❌ Error searching messages:', error);
+      return [];
+    }
+  }
+
   async deleteMessage(messageId) {
     try {
       await this.ensureInitialized();
@@ -414,11 +427,11 @@ class DatabaseService {
       
       let deviceName;
       if (isBroadcast) {
-        deviceName = '📢 Broadcast to All';
+        deviceName = 'Broadcast to All';
       } else if (message.is_mine) {
         // We sent this message, get recipient name
         const device = await this.getDevice(message.receiver_id);
-        deviceName = device?.name || `Device_${message.receiver_id?.substring(0, 8)}`;
+        deviceName = device?.name || (message.receiver_id ? `Device_${message.receiver_id.substring(0, 8)}` : 'Unknown');
       } else {
         // We received this message
         deviceName = message.sender_name;
@@ -427,16 +440,28 @@ class DatabaseService {
       // Calculate unread count
       const unreadCount = await this.getUnreadCount(conversationId, message.message_type);
 
+      // Build a short conversation preview (never store raw base64 in conversation preview)
+      let preview = message.content;
+      if (preview && preview.startsWith('{')) {
+        try {
+          const parsed = JSON.parse(preview);
+          if (parsed.type === 'photo') preview = '[Photo]';
+          else if (parsed.type === 'location') preview = '[Location]';
+          else preview = parsed.text || preview;
+        } catch (_e) { /* keep raw */ }
+      }
+      if (preview && preview.length > 100) preview = preview.substring(0, 100) + '...';
+
       // Insert or update conversation
       await this.db.executeSql(
-        `INSERT OR REPLACE INTO conversations 
-         (id, device_id, device_name, last_message, last_message_time, unread_count, message_type, updated_at) 
+        `INSERT OR REPLACE INTO conversations
+         (id, device_id, device_name, last_message, last_message_time, unread_count, message_type, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'));`,
         [
           conversationId,
           isBroadcast ? null : conversationId,
           deviceName,
-          message.content.length > 100 ? message.content.substring(0, 100) + '...' : message.content,
+          preview,
           message.timestamp,
           unreadCount,
           message.message_type
@@ -469,27 +494,91 @@ class DatabaseService {
     }
   }
 
-  async getConversation(conversationId) {
+  // ============ UTILITY METHODS ============
+
+  async pinMessage(messageId, pinned) {
     try {
       await this.ensureInitialized();
-      const [results] = await this.db.executeSql(
-        'SELECT * FROM conversations WHERE id = ?;',
-        [conversationId]
+      await this.db.executeSql(
+        'UPDATE messages SET is_pinned = ? WHERE id = ?;',
+        [pinned ? 1 : 0, messageId]
       );
-      
-      return results.rows.length > 0 ? this.normalizeConversation(results.rows.item(0)) : null;
+      return true;
     } catch (error) {
-      console.error('❌ Error getting conversation:', error);
+      console.error('❌ Error pinning message:', error);
       throw error;
     }
   }
 
-  // ============ UTILITY METHODS ============
+  async getPinnedMessages(conversationId, isBroadcast) {
+    try {
+      await this.ensureInitialized();
+      let query, params;
+      if (isBroadcast) {
+        query = `SELECT * FROM messages WHERE is_pinned = 1 AND message_type = 'broadcast' ORDER BY timestamp ASC;`;
+        params = [];
+      } else {
+        query = `SELECT * FROM messages WHERE is_pinned = 1 AND message_type = 'direct'
+                 AND (sender_id = ? OR receiver_id = ?) ORDER BY timestamp ASC;`;
+        params = [conversationId, conversationId];
+      }
+      const [results] = await this.db.executeSql(query, params);
+      const messages = [];
+      for (let i = 0; i < results.rows.length; i++)
+        messages.push(this.normalizeMessage(results.rows.item(i)));
+      return messages;
+    } catch (error) {
+      console.error('❌ Error getting pinned messages:', error);
+      return [];
+    }
+  }
+
+  async getMediaMessages(conversationId, isBroadcast) {
+    try {
+      await this.ensureInitialized();
+      let query, params;
+      if (isBroadcast) {
+        query = `SELECT * FROM messages WHERE message_type = 'broadcast'
+                 AND (content LIKE '{"type":"photo"%' OR content LIKE '{"type":"location"%')
+                 ORDER BY timestamp DESC;`;
+        params = [];
+      } else {
+        query = `SELECT * FROM messages WHERE message_type = 'direct'
+                 AND (sender_id = ? OR receiver_id = ?)
+                 AND (content LIKE '{"type":"photo"%' OR content LIKE '{"type":"location"%')
+                 ORDER BY timestamp DESC;`;
+        params = [conversationId, conversationId];
+      }
+      const [results] = await this.db.executeSql(query, params);
+      const messages = [];
+      for (let i = 0; i < results.rows.length; i++)
+        messages.push(this.normalizeMessage(results.rows.item(i)));
+      return messages;
+    } catch (error) {
+      console.error('❌ Error getting media messages:', error);
+      return [];
+    }
+  }
 
   normalizeMessage(dbMessage) {
+    let contentType = 'text';
+    let mediaData = null;
+
+    if (dbMessage.content && dbMessage.content.startsWith('{')) {
+      try {
+        const parsed = JSON.parse(dbMessage.content);
+        if (parsed.type === 'photo' || parsed.type === 'location') {
+          contentType = parsed.type;
+          mediaData = parsed;
+        }
+      } catch (_e) { /* not JSON */ }
+    }
+
     return {
       id: dbMessage.id,
-      text: dbMessage.content,
+      text: mediaData?.text || dbMessage.content,
+      contentType,
+      mediaData,
       senderId: dbMessage.sender_id,
       senderName: dbMessage.sender_name,
       receiverId: dbMessage.receiver_id,
@@ -499,6 +588,9 @@ class DatabaseService {
       timestamp: dbMessage.timestamp,
       read: dbMessage.read_status === 1,
       deliveryStatus: dbMessage.delivery_status,
+      isPinned: dbMessage.is_pinned === 1,
+      replyToId: dbMessage.reply_to_id || null,
+      replyPreview: dbMessage.reply_preview || null,
       createdAt: dbMessage.created_at
     };
   }
@@ -538,26 +630,6 @@ class DatabaseService {
     } catch (error) {
       console.error('❌ Error getting database size:', error);
       return 0;
-    }
-  }
-
-  async backupDatabase() {
-    try {
-      await this.ensureInitialized();
-      const timestamp = Date.now();
-      const backupName = `PeerReachDB_backup_${timestamp}.db`;
-      
-      await this.db.executeSql(`ATTACH DATABASE '${backupName}' AS backup;`);
-      await this.db.executeSql('CREATE TABLE backup.messages AS SELECT * FROM main.messages;');
-      await this.db.executeSql('CREATE TABLE backup.devices AS SELECT * FROM main.devices;');
-      await this.db.executeSql('CREATE TABLE backup.conversations AS SELECT * FROM main.conversations;');
-      await this.db.executeSql('DETACH DATABASE backup;');
-      
-      console.log(`✅ Database backed up as ${backupName}`);
-      return backupName;
-    } catch (error) {
-      console.error('❌ Error backing up database:', error);
-      throw error;
     }
   }
 

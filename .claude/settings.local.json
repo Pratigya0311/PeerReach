@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./gradlew assembleRelease)",
+      "Bash(sdkmanager --list_installed)",
+      "Read(//c/Users/Sadhana/AppData/Local/Android/Sdk/system-images/**)",
+      "Read(//c/Users/Sadhana/AppData/Local/Android/Sdk/platforms/**)",
+      "Bash(find C:/Users/Sadhana/AppData/Local/Android/Sdk/system-images/ -name *.img)",
+      "Bash(\"C:/Users/Sadhana/AppData/Local/Android/Sdk/cmdline-tools/latest/bin/avdmanager.bat\" create:*)",
+      "Bash(adb devices:*)",
+      "Bash(adb kill-server:*)",
+      "Bash(adb start-server:*)",
+      "Bash(tasklist)",
+      "Bash(adb connect:*)",
+      "Bash(adb wait-for-device:*)",
+      "Bash(python:*)",
+      "Bash(./gradlew assembleRelease --no-daemon)",
+      "Bash(adb install:*)",
+      "Bash(adb logcat:*)",
+      "Bash(adb shell:*)",
+      "Bash(find C:/Users/Sadhana/.gradle/caches -name *.pom)",
+      "Bash(xargs grep:*)",
+      "Bash(find C:/Users/Sadhana/.gradle/caches -name *.module)",
+      "Bash(find C:/Users/Sadhana/.gradle/caches/9.0.0/transforms -name *.txt)",
+      "Bash(find C:/Users/Sadhana/.gradle/caches -name dagger-*.jar)",
+      "Bash(find C:/Users/Sadhana/.gradle/caches/modules-2/files-2.1/androidx.security -name *.aar)",
+      "Bash(find C:/Users/Sadhana/.gradle/caches/modules-2/files-2.1/androidx.room -name *.aar -o -name *.jar)",
+      "Bash(find C:/Users/Sadhana/.gradle -name room-runtime-2.7*)"
+    ]
+  }
+}

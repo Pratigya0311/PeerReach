@@ -1,8 +1,9 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import {
   View,
   Text,
   FlatList,
+  TextInput,
   TouchableOpacity,
   StyleSheet,
   ActivityIndicator,
@@ -10,31 +11,48 @@ import {
   PermissionsAndroid,
   Platform,
   RefreshControl,
-  SafeAreaView,
+  Modal,
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect } from '@react-navigation/native';
+import Icon from 'react-native-vector-icons/MaterialIcons';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import BridgefyService from '../services/BridgefyService';
+import { useTheme } from '../theme';
+
+const DISPLAY_NAME_KEY = '@peerreach_display_name';
+
+const SEARCH_DEBOUNCE_MS = 300;
 
 const HomeScreen = ({ navigation }) => {
-  const [conversations, setConversations] = useState([]);
-  const [isLoading, setIsLoading] = useState(true);
-  const [myDeviceId, setMyDeviceId] = useState('');
-  const [myDeviceName, setMyDeviceName] = useState('');
-  const [unreadCounts, setUnreadCounts] = useState({ total: 0, broadcast: 0, direct: 0 });
-  const [refreshing, setRefreshing] = useState(false);
-  const [bridgefyStatus, setBridgefyStatus] = useState('initializing');
+  const colors = useTheme();
+  const styles = useMemo(() => makeStyles(colors), [colors]);
+
+  const [conversations, setConversations]     = useState([]);
+  const [isLoading, setIsLoading]             = useState(true);
+  const [myDeviceId, setMyDeviceId]           = useState('');
+  const [myDeviceName, setMyDeviceName]       = useState('');
+  const [unreadCounts, setUnreadCounts]       = useState({ total: 0, broadcast: 0, direct: 0 });
+  const [refreshing, setRefreshing]           = useState(false);
+  const [bridgefyStatus, setBridgefyStatus]   = useState('initializing');
+
+  // Search state
+  const [searchQuery, setSearchQuery]   = useState('');
+  const [searchResults, setSearchResults] = useState([]);
+  const [isSearching, setIsSearching]   = useState(false);
+  const [namePromptVisible, setNamePromptVisible] = useState(false);
+  const [nameInput, setNameInput]       = useState('');
+  const searchTimerRef  = useRef(null);
+  const navTimerRef     = useRef(null);
 
   useFocusEffect(
     useCallback(() => {
-      loadData();
-      return () => {
-      };
+      loadData().catch(console.error);
     }, [])
   );
 
   useEffect(() => {
     console.log('🏠 HomeScreen mounted');
-
     BridgefyService.setOnNewMessageHandler(handleNewMessage);
     BridgefyService.setOnReadyHandler(handleBridgefyReady);
     BridgefyService.setOnErrorHandler(handleBridgefyError);
@@ -47,16 +65,8 @@ const HomeScreen = ({ navigation }) => {
         setIsLoading(false);
         Alert.alert(
           'Permissions Required',
-          'Location and Bluetooth permissions are required for PeerReach to work. Please enable them in settings.',
-          [
-            { text: 'Cancel', style: 'cancel' },
-            { text: 'Open Settings', onPress: () => {
-              if (Platform.OS === 'android') {
-                // Open app settings
-                // You might need a package like react-native-app-settings
-              }
-            }}
-          ]
+          'Location and Bluetooth permissions are required for PeerReach to work.',
+          [{ text: 'OK' }]
         );
       }
     });
@@ -66,71 +76,74 @@ const HomeScreen = ({ navigation }) => {
       BridgefyService.setOnReadyHandler(null);
       BridgefyService.setOnErrorHandler(null);
       BridgefyService.setOnUnreadUpdatedHandler(null);
+      if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
+      if (navTimerRef.current) clearTimeout(navTimerRef.current);
     };
   }, []);
 
-    const requestPermissions = async () => {
-    if (Platform.OS === 'android') {
-      try {
-        if (Platform.Version >= 31) {
-          const result = await PermissionsAndroid.requestMultiple([
-            'android.permission.BLUETOOTH_SCAN',
-            'android.permission.BLUETOOTH_CONNECT',
-            'android.permission.BLUETOOTH_ADVERTISE',
-            'android.permission.ACCESS_FINE_LOCATION'
-          ]);
-          
-          return (
-            result['android.permission.BLUETOOTH_CONNECT'] === 'granted' &&
-            result['android.permission.BLUETOOTH_SCAN'] === 'granted' &&
-            result['android.permission.BLUETOOTH_ADVERTISE'] === 'granted' &&
-            result['android.permission.ACCESS_FINE_LOCATION'] === 'granted'
-          );
-        } 
-        else {
-          const granted = await PermissionsAndroid.request(
-            PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION
-          );
-          return granted === PermissionsAndroid.RESULTS.GRANTED;
-        }
-      } catch (err) {
-        console.warn('Permission Error:', err);
-        return false;
+  // Show name prompt if no custom display name has ever been saved
+  useEffect(() => {
+    AsyncStorage.getItem(DISPLAY_NAME_KEY).then(saved => {
+      if (!saved || !saved.trim()) setNamePromptVisible(true);
+    }).catch(() => {});
+  }, []);
+
+  // ─── Permissions ──────────────────────────────────────────────────────────
+  const requestPermissions = async () => {
+    if (Platform.OS !== 'android') return true;
+    try {
+      if (Platform.Version >= 31) {
+        const result = await PermissionsAndroid.requestMultiple([
+          'android.permission.BLUETOOTH_SCAN',
+          'android.permission.BLUETOOTH_CONNECT',
+          'android.permission.BLUETOOTH_ADVERTISE',
+          'android.permission.ACCESS_FINE_LOCATION',
+        ]);
+        return (
+          result['android.permission.BLUETOOTH_CONNECT'] === 'granted' &&
+          result['android.permission.BLUETOOTH_SCAN'] === 'granted' &&
+          result['android.permission.BLUETOOTH_ADVERTISE'] === 'granted' &&
+          result['android.permission.ACCESS_FINE_LOCATION'] === 'granted'
+        );
       }
+      const granted = await PermissionsAndroid.request(
+        PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION
+      );
+      return granted === PermissionsAndroid.RESULTS.GRANTED;
+    } catch (_e) {
+      return false;
     }
-    return true; 
   };
 
-
+  // ─── Init ─────────────────────────────────────────────────────────────────
   const initializeBridgefy = async () => {
     try {
       setBridgefyStatus('initializing');
       console.log('🚀 Initializing Bridgefy...');
-      
-      const API_KEY = 'e33f9719-66d1-4d19-acd0-3fb186c915a3';
-      
+      const API_KEY = '8a349463-829d-4c67-a489-4a4c5cb82eba';
       if (!API_KEY || API_KEY.length < 36) {
         Alert.alert('Invalid API Key', 'Please check your Bridgefy API key configuration.');
         setIsLoading(false);
         setBridgefyStatus('error');
         return;
       }
-      
-      await BridgefyService.initialize(API_KEY);
-
-      const deviceId = await BridgefyService.getMyDeviceId();
-      const deviceName = await BridgefyService.getMyDeviceName();
-      
-      setMyDeviceId(deviceId);
-      setMyDeviceName(deviceName);
-
-      await loadData();
-      
-      setBridgefyStatus('ready');
-      setIsLoading(false);
-      
-      console.log('✅ Bridgefy initialized successfully');
-      
+      // initialize() fires-and-forgets on the native side (no Promise).
+      // Actual readiness is signalled by onRegistrationSuccessful → handleBridgefyReady.
+      // We just add a safety timeout so the loading screen doesn't hang forever.
+      BridgefyService.initialize(API_KEY);
+      navTimerRef.current = setTimeout(() => {
+        setIsLoading(prev => {
+          if (prev) {
+            setBridgefyStatus('error');
+            Alert.alert(
+              'Initialization Timeout',
+              'Could not start mesh network. Please check Bluetooth is enabled and permissions are granted.',
+              [{ text: 'OK' }]
+            );
+          }
+          return false;
+        });
+      }, 20000);
     } catch (error) {
       console.error('❌ Bridgefy initialization failed:', error);
       setBridgefyStatus('error');
@@ -138,7 +151,7 @@ const HomeScreen = ({ navigation }) => {
       Alert.alert(
         'Initialization Failed',
         `Could not start Bridgefy: ${error.message || 'Unknown error'}\n\nPlease check:\n1. Your API key\n2. Bluetooth is enabled\n3. Location permission is granted`,
-        [{ text: 'OK', style: 'default' }]
+        [{ text: 'OK' }]
       );
     }
   };
@@ -146,161 +159,261 @@ const HomeScreen = ({ navigation }) => {
   const loadData = async () => {
     try {
       setRefreshing(true);
-
       await BridgefyService.getConnectedDevices();
-
-      const convos = await BridgefyService.getConversations();
+      const convos  = await BridgefyService.getConversations();
+      const counts  = await BridgefyService.getUnreadCounts();
       setConversations(convos);
-
-      const counts = BridgefyService.getUnreadCounts();
       setUnreadCounts(counts);
-      
-      setRefreshing(false);
     } catch (error) {
       console.error('Error loading data:', error);
+    } finally {
       setRefreshing(false);
     }
   };
 
-  const handleNewMessage = (data) => {
-    console.log('📨 New message received in HomeScreen');
-    loadData();
-  };
-
-  const handleBridgefyReady = (data) => {
+  // ─── Event handlers ───────────────────────────────────────────────────────
+  const handleNewMessage     = ()      => { console.log('📨 New message received in HomeScreen'); loadData().catch(console.error); };
+  const handleBridgefyReady  = (data)  => {
     console.log('✅ Bridgefy ready:', data);
+    if (navTimerRef.current) clearTimeout(navTimerRef.current);
     setMyDeviceId(data.deviceId);
     setMyDeviceName(data.deviceName);
     setBridgefyStatus('ready');
-    loadData();
+    setIsLoading(false);
+    loadData().catch(err => console.error('Error loading data on ready:', err));
   };
-
-  const handleBridgefyError = (error) => {
-    console.error('❌ Bridgefy error:', error);
+  const handleBridgefyError  = (error) => {
+    console.warn('⚠️ Bridgefy error:', error);
+    if (navTimerRef.current) clearTimeout(navTimerRef.current);
     setBridgefyStatus('error');
-    Alert.alert('Bridgefy Error', error.message || 'Unknown error occurred');
+    setIsLoading(false);
   };
+  const handleUnreadUpdated  = (counts) => setUnreadCounts(counts);
 
-  const handleUnreadUpdated = (counts) => {
-    setUnreadCounts(counts);
-  };
-
+  // ─── Navigation ───────────────────────────────────────────────────────────
   const openChat = async (conversation) => {
-    await BridgefyService.markAsRead(conversation.id, conversation.isBroadcast);
-    
+    try {
+      await BridgefyService.markAsRead(conversation.id, conversation.isBroadcast);
+    } catch (err) {
+      console.error('markAsRead failed:', err);
+    }
     BridgefyService.setCurrentChat(conversation.id);
-    
     navigation.navigate('Chat', {
-      deviceId: conversation.id,
+      deviceId:   conversation.id,
       deviceName: conversation.name,
-      isBroadcast: conversation.isBroadcast
+      isBroadcast: conversation.isBroadcast,
     });
-
-    setTimeout(loadData, 500);
+    navTimerRef.current = setTimeout(() => { loadData().catch(console.error); }, 500);
   };
 
-  const openNewChat = () => {
-    navigation.navigate('Devices');
+  // ─── Search ───────────────────────────────────────────────────────────────
+  const handleSearchChange = (text) => {
+    setSearchQuery(text);
+    if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
+
+    if (text.length < 2) {
+      setSearchResults([]);
+      setIsSearching(false);
+      return;
+    }
+
+    setIsSearching(true);
+    searchTimerRef.current = setTimeout(async () => {
+      try {
+        const results = await BridgefyService.searchMessages(text);
+        setSearchResults(results);
+      } catch (_e) {
+        setSearchResults([]);
+      } finally {
+        setIsSearching(false);
+      }
+    }, SEARCH_DEBOUNCE_MS);
   };
 
-  const renderConversation = ({ item }) => {
-    const timeAgo = formatTimeAgo(item.timestamp);
-    
+  const confirmDisplayName = async () => {
+    const trimmed = nameInput.trim();
+    if (!trimmed) { Alert.alert('Name required', 'Please enter a display name.'); return; }
+    await BridgefyService.setDisplayName(trimmed);
+    setMyDeviceName(trimmed);
+    setNamePromptVisible(false);
+  };
+
+  const clearSearch = () => {
+    setSearchQuery('');
+    setSearchResults([]);
+    setIsSearching(false);
+    if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
+  };
+
+  const inSearchMode = searchQuery.length >= 2;
+
+  // ─── Helpers ──────────────────────────────────────────────────────────────
+  const formatTimeAgo = (timestamp) => {
+    if (!timestamp) return '';
+    const diff    = Date.now() - timestamp;
+    const minutes = Math.floor(diff / 60000);
+    const hours   = Math.floor(diff / 3600000);
+    const days    = Math.floor(diff / 86400000);
+    if (minutes < 1)  return 'Just now';
+    if (minutes < 60) return `${minutes}m ago`;
+    if (hours < 24)   return `${hours}h ago`;
+    if (days < 7)     return `${days}d ago`;
+    return new Date(timestamp).toLocaleDateString();
+  };
+
+  // ─── Render: conversation row ─────────────────────────────────────────────
+  const renderConversation = ({ item }) => (
+    <TouchableOpacity
+      style={[styles.conversationCard, item.unreadCount > 0 && styles.unreadConversation]}
+      onPress={() => openChat(item)}
+    >
+      <View style={[styles.avatar, item.isBroadcast ? styles.avatarBroadcast : styles.avatarDirect]}>
+        <Text style={styles.avatarText}>
+          {item.isBroadcast ? 'BC' : (item.name || '?')[0].toUpperCase()}
+        </Text>
+        {item.unreadCount > 0 && (
+          <View style={styles.avatarBadge}>
+            <Text style={styles.avatarBadgeText}>
+              {item.unreadCount > 9 ? '9+' : item.unreadCount}
+            </Text>
+          </View>
+        )}
+      </View>
+
+      <View style={styles.conversationInfo}>
+        <View style={styles.conversationHeader}>
+          <Text style={styles.conversationName} numberOfLines={1}>{item.name}</Text>
+          <Text style={styles.conversationTime}>{formatTimeAgo(item.timestamp)}</Text>
+        </View>
+        <Text
+          style={[styles.lastMessage, item.unreadCount > 0 && styles.unreadLastMessage]}
+          numberOfLines={2}
+        >
+          {item.isBroadcast ? `${item.senderName}: ` : ''}{item.lastMessage}
+        </Text>
+      </View>
+    </TouchableOpacity>
+  );
+
+  // ─── Render: search result row ────────────────────────────────────────────
+  const renderSearchResult = ({ item }) => {
+    const isPhoto    = item.contentType === 'photo';
+    const isLocation = item.contentType === 'location';
+    const preview    = isPhoto ? '[Photo]' : isLocation ? '[Location]' : (item.text || '');
+    const snippet    = preview.length > 90 ? preview.substring(0, 90) + '…' : preview;
+
+    let convName, convId, isBroadcast;
+    if (item.isBroadcast) {
+      convName    = 'Broadcast to All';
+      convId      = 'broadcast';
+      isBroadcast = true;
+    } else if (item.isMine) {
+      convId      = item.receiverId || null;
+      const conv  = conversations.find(c => c.id === convId);
+      convName    = conv?.name || (convId ? `Device ${convId.substring(0, 8)}` : 'Unknown');
+      isBroadcast = false;
+    } else {
+      convName    = item.senderName || 'Unknown';
+      convId      = item.senderId || null;
+      isBroadcast = false;
+    }
+
     return (
       <TouchableOpacity
-        style={[
-          styles.conversationCard,
-          item.unreadCount > 0 && styles.unreadConversation
-        ]}
-        onPress={() => openChat(item)}
+        style={styles.searchResultCard}
+        onPress={() => { if (convId) openChat({ id: convId, name: convName, isBroadcast }); }}
       >
-        <View style={[styles.avatar, item.isBroadcast ? styles.avatarBroadcast : styles.avatarDirect]}>
-          <Text style={styles.avatarText}>
-            {item.isBroadcast ? 'BC' : (item.name || '?')[0].toUpperCase()}
-          </Text>
-          {item.unreadCount > 0 && (
-            <View style={styles.avatarBadge}>
-              <Text style={styles.avatarBadgeText}>
-                {item.unreadCount > 9 ? '9+' : item.unreadCount}
-              </Text>
-            </View>
-          )}
+        <View style={styles.searchResultHeader}>
+          <Text style={styles.searchResultFrom} numberOfLines={1}>{convName}</Text>
+          <Text style={styles.searchResultTime}>{formatTimeAgo(item.timestamp)}</Text>
         </View>
-        
-        <View style={styles.conversationInfo}>
-          <View style={styles.conversationHeader}>
-            <Text style={styles.conversationName} numberOfLines={1}>
-              {item.name}
-            </Text>
-            <Text style={styles.conversationTime}>{timeAgo}</Text>
-          </View>
-          
-          <Text 
-            style={[
-              styles.lastMessage,
-              item.unreadCount > 0 && styles.unreadLastMessage
-            ]} 
-            numberOfLines={2}
-          >
-            {item.isBroadcast ? `${item.senderName}: ` : ''}{item.lastMessage}
-          </Text>
-        </View>
+        <Text style={styles.searchResultText} numberOfLines={2}>{snippet}</Text>
       </TouchableOpacity>
     );
   };
 
-  const formatTimeAgo = (timestamp) => {
-    if (!timestamp) return '';
-    
-    const now = Date.now();
-    const diff = now - timestamp;
-    const minutes = Math.floor(diff / 60000);
-    const hours = Math.floor(diff / 3600000);
-    const days = Math.floor(diff / 86400000);
-    
-    if (minutes < 1) return 'Just now';
-    if (minutes < 60) return `${minutes}m ago`;
-    if (hours < 24) return `${hours}h ago`;
-    if (days < 7) return `${days}d ago`;
-    
-    return new Date(timestamp).toLocaleDateString();
-  };
-
+  // ─── Loading state ────────────────────────────────────────────────────────
   if (isLoading) {
     return (
       <SafeAreaView style={styles.loadingContainer}>
-        <ActivityIndicator size="large" color="#007AFF" />
+        <ActivityIndicator size="large" color={colors.primary} />
         <Text style={styles.loadingText}>Starting PeerReach...</Text>
         <Text style={styles.loadingSubtext}>
           {bridgefyStatus === 'initializing' && 'Initializing mesh network...'}
-          {bridgefyStatus === 'error' && 'Failed to start. Please check permissions.'}
+          {bridgefyStatus === 'error'        && 'Failed to start. Please check permissions.'}
         </Text>
       </SafeAreaView>
     );
   }
 
+  // ─── Main render ──────────────────────────────────────────────────────────
   return (
     <SafeAreaView style={styles.container}>
+
+      {/* First-launch display name prompt */}
+      <Modal visible={namePromptVisible} transparent animationType="fade">
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>What's your name?</Text>
+            <Text style={styles.modalSubtitle}>
+              This is how you appear to other devices on the mesh.
+            </Text>
+            <TextInput
+              style={styles.modalInput}
+              placeholder="Enter display name"
+              placeholderTextColor="#999"
+              value={nameInput}
+              onChangeText={setNameInput}
+              maxLength={32}
+              autoFocus
+              returnKeyType="done"
+              onSubmitEditing={confirmDisplayName}
+            />
+            <TouchableOpacity
+              style={[styles.modalBtn, !nameInput.trim() && styles.modalBtnDisabled]}
+              onPress={confirmDisplayName}
+              disabled={!nameInput.trim()}
+            >
+              <Text style={styles.modalBtnText}>Continue</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
       {/* Header */}
       <View style={styles.header}>
         <View style={styles.headerTop}>
-          <Text style={styles.title}>PeerReach</Text>
-          {unreadCounts.total > 0 && (
-            <View style={styles.headerBadge}>
-              <Text style={styles.headerBadgeText}>{unreadCounts.total}</Text>
-            </View>
-          )}
+          <View style={styles.headerTitleGroup}>
+            <Text style={styles.title}>PeerReach</Text>
+            {unreadCounts.total > 0 && (
+              <View style={styles.headerBadge}>
+                <Text style={styles.headerBadgeText}>{unreadCounts.total}</Text>
+              </View>
+            )}
+          </View>
+          <View style={styles.headerActions}>
+            <TouchableOpacity
+              style={styles.logsBtn}
+              onPress={() => navigation.navigate('Logs')}
+            >
+              <Text style={styles.logsBtnText}>Logs</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.settingsBtn}
+              onPress={() => navigation.navigate('Settings')}
+            >
+              <Text style={styles.settingsIcon}>{'\ue8b8'}</Text>
+            </TouchableOpacity>
+          </View>
         </View>
-        
         <Text style={styles.subtitle}>
-          {myDeviceName} • ID: {myDeviceId ? myDeviceId.substring(0, 8) + '...' : 'Unknown'}
+          {myDeviceName} · {myDeviceId ? myDeviceId.substring(0, 8) + '...' : 'Unknown'}
         </Text>
-        
         <View style={styles.statusRow}>
           <View style={[styles.statusDot, bridgefyStatus === 'ready' ? styles.dotOnline : styles.dotOffline]} />
           <Text style={styles.status}>
             {bridgefyStatus === 'ready' ? 'Online' : 'Offline'}
-            {conversations.length > 0 && ` • ${conversations.length} conversation${conversations.length !== 1 ? 's' : ''}`}
+            {conversations.length > 0 && ` · ${conversations.length} conversation${conversations.length !== 1 ? 's' : ''}`}
           </Text>
         </View>
       </View>
@@ -310,19 +423,17 @@ const HomeScreen = ({ navigation }) => {
         <TouchableOpacity
           style={[styles.actionButton, styles.broadcastButton]}
           onPress={() => openChat({
-            id: 'broadcast',
-            name: 'Broadcast to All',
-            isBroadcast: true,
-            timestamp: Date.now(),
-            lastMessage: 'Send messages to all nearby devices'
+            id: 'broadcast', name: 'Broadcast to All',
+            isBroadcast: true, timestamp: Date.now(),
+            lastMessage: 'Send messages to all nearby devices',
           })}
         >
           <Text style={styles.actionButtonText}>Broadcast</Text>
         </TouchableOpacity>
-        
+
         <TouchableOpacity
           style={[styles.actionButton, styles.newChatButton]}
-          onPress={openNewChat}
+          onPress={() => navigation.navigate('Devices')}
         >
           <Text style={styles.actionButtonText}>+ New Chat</Text>
         </TouchableOpacity>
@@ -335,265 +446,271 @@ const HomeScreen = ({ navigation }) => {
         </TouchableOpacity>
       </View>
 
-      {/* Conversations List */}
-      <FlatList
-        data={conversations}
-        renderItem={renderConversation}
-        keyExtractor={(item) => item.id}
-        contentContainerStyle={styles.list}
-        refreshControl={
-          <RefreshControl
-            refreshing={refreshing}
-            onRefresh={loadData}
-            colors={['#007AFF']}
-          />
-        }
-        ListEmptyComponent={
-          <View style={styles.emptyState}>
-            <View style={styles.emptyIconCircle} />
-            <Text style={styles.emptyText}>No conversations yet</Text>
-            <Text style={styles.emptySubtext}>
-              Start a broadcast or chat with nearby devices
-            </Text>
-            <TouchableOpacity
-              style={styles.emptyButton}
-              onPress={() => BridgefyService.getConnectedDevices().then(loadData)}
-            >
-              <Text style={styles.emptyButtonText}>Refresh Devices</Text>
-            </TouchableOpacity>
-          </View>
-        }
-      />
+      {/* Search bar */}
+      <View style={styles.searchRow}>
+        <TextInput
+          style={styles.searchInput}
+          placeholder="Search messages..."
+          placeholderTextColor={colors.placeholder}
+          value={searchQuery}
+          onChangeText={handleSearchChange}
+          returnKeyType="search"
+          autoCorrect={false}
+        />
+        {searchQuery.length > 0 && (
+          <TouchableOpacity style={styles.searchClearBtn} onPress={clearSearch}>
+            <Text style={styles.searchClearText}>{'\u00D7'}</Text>
+          </TouchableOpacity>
+        )}
+      </View>
+
+      {/* List — conversations OR search results */}
+      {inSearchMode && isSearching ? (
+        <View style={styles.searchLoadingRow}>
+          <ActivityIndicator size="small" color={colors.primary} />
+          <Text style={styles.searchLoadingText}>Searching...</Text>
+        </View>
+      ) : (
+        <FlatList
+          data={inSearchMode ? searchResults : conversations}
+          renderItem={inSearchMode ? renderSearchResult : renderConversation}
+          keyExtractor={(item) =>
+            inSearchMode ? `sr_${item.id}` : item.id
+          }
+          contentContainerStyle={styles.list}
+          keyboardShouldPersistTaps="handled"
+          refreshControl={
+            !inSearchMode ? (
+              <RefreshControl
+                refreshing={refreshing}
+                onRefresh={loadData}
+                colors={[colors.primary]}
+              tintColor={colors.primary}
+              />
+            ) : undefined
+          }
+          ListEmptyComponent={
+            inSearchMode ? (
+              <View style={styles.emptyState}>
+                <View style={styles.emptyIconCircle} />
+                <Text style={styles.emptyText}>No results found</Text>
+                <Text style={styles.emptySubtext}>Try a different search term</Text>
+              </View>
+            ) : (
+              <View style={styles.emptyState}>
+                <View style={styles.emptyIconCircle} />
+                <Text style={styles.emptyText}>No conversations yet</Text>
+                <Text style={styles.emptySubtext}>
+                  Start a broadcast or chat with nearby devices
+                </Text>
+                <TouchableOpacity
+                  style={styles.emptyButton}
+                  onPress={() => BridgefyService.getConnectedDevices().then(loadData)}
+                >
+                  <Text style={styles.emptyButtonText}>Refresh Devices</Text>
+                </TouchableOpacity>
+              </View>
+            )
+          }
+        />
+      )}
     </SafeAreaView>
   );
 };
 
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#F5F5F5',
-  },
+// ─── Styles (theme-aware) ────────────────────────────────────────────────────
+const makeStyles = (colors) => StyleSheet.create({
+  container:      { flex: 1, backgroundColor: colors.background },
   loadingContainer: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    backgroundColor: '#F5F5F5',
-    padding: 20,
+    flex: 1, justifyContent: 'center', alignItems: 'center',
+    backgroundColor: colors.background, padding: 20,
   },
-  loadingText: {
-    fontSize: 18,
-    fontWeight: '600',
-    color: '#333',
-    marginTop: 20,
-    marginBottom: 8,
-  },
-  loadingSubtext: {
-    fontSize: 14,
-    color: '#666',
-    textAlign: 'center',
-    paddingHorizontal: 40,
-  },
+  loadingText:    { fontSize: 18, fontWeight: '600', color: colors.text, marginTop: 20, marginBottom: 8 },
+  loadingSubtext: { fontSize: 14, color: colors.textSecondary, textAlign: 'center', paddingHorizontal: 40 },
+
+  // Header
   header: {
-    backgroundColor: '#007AFF',
+    backgroundColor: colors.headerBg,
     padding: 20,
-    paddingTop: 50,
+    paddingTop: 16,
   },
-  headerTop: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginBottom: 8,
+  headerTop: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 },
+  headerTitleGroup: { flexDirection: 'row', alignItems: 'center' },
+  settingsBtn: {
+    backgroundColor: 'rgba(255,255,255,0.15)',
+    borderRadius: 6,
+    padding: 6,
   },
-  title: {
-    fontSize: 28,
-    fontWeight: 'bold',
-    color: 'white',
+  settingsIcon: {
+    fontFamily: 'MaterialIcons',
+    fontSize: 20,
+    color: '#FFFFFF',
   },
+  headerActions: {
+    flexDirection: 'row', alignItems: 'center', gap: 6,
+  },
+  logsBtn: {
+    backgroundColor: 'rgba(255,255,255,0.15)',
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 6,
+  },
+  logsBtnText: { color: colors.onColor, fontSize: 12, fontWeight: '600' },
+  title: { fontSize: 28, fontWeight: 'bold', color: colors.headerText },
   headerBadge: {
-    backgroundColor: '#FF3B30',
-    borderRadius: 12,
-    minWidth: 24,
-    height: 24,
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginLeft: 10,
-    paddingHorizontal: 6,
+    backgroundColor: colors.error,
+    borderRadius: 12, minWidth: 24, height: 24,
+    justifyContent: 'center', alignItems: 'center',
+    marginLeft: 10, paddingHorizontal: 6,
   },
-  headerBadgeText: {
-    color: 'white',
-    fontSize: 12,
-    fontWeight: 'bold',
-  },
-  subtitle: {
-    fontSize: 14,
-    color: 'rgba(255,255,255,0.9)',
-    marginBottom: 4,
-  },
-  statusRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-  statusDot: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-    marginRight: 6,
-  },
-  dotOnline: { backgroundColor: '#34C759' },
-  dotOffline: { backgroundColor: '#FF3B30' },
-  status: {
-    fontSize: 12,
-    color: 'rgba(255,255,255,0.7)',
-  },
+  headerBadgeText: { color: colors.onColor, fontSize: 12, fontWeight: 'bold' },
+  subtitle: { fontSize: 14, color: colors.headerSubtitle, marginBottom: 4 },
+  statusRow: { flexDirection: 'row', alignItems: 'center' },
+  statusDot: { width: 8, height: 8, borderRadius: 4, marginRight: 6 },
+  dotOnline:  { backgroundColor: colors.success },
+  dotOffline: { backgroundColor: colors.error },
+  status: { fontSize: 12, color: colors.headerStatusText },
+
+  // Action buttons
   actionButtons: {
     flexDirection: 'row',
-    padding: 16,
-    backgroundColor: 'white',
+    padding: 12,
+    backgroundColor: colors.actionRowBg,
     borderBottomWidth: 1,
-    borderBottomColor: '#E0E0E0',
+    borderBottomColor: colors.border,
   },
-  actionButton: {
-    flex: 1,
-    padding: 14,
-    borderRadius: 10,
-    alignItems: 'center',
-    marginHorizontal: 6,
-  },
-  broadcastButton: {
-    backgroundColor: '#FF9500',
-  },
-  newChatButton: {
-    backgroundColor: '#34C759',
-  },
-  askMeshButton: {
-    backgroundColor: '#5856D6',
-  },
-  actionButtonText: {
-    color: 'white',
-    fontSize: 16,
-    fontWeight: '600',
-  },
-  list: {
-    padding: 16,
-    paddingBottom: 32,
-  },
-  conversationCard: {
-    backgroundColor: 'white',
-    borderRadius: 12,
-    padding: 16,
-    marginBottom: 12,
+  actionButton: { flex: 1, padding: 12, borderRadius: 10, alignItems: 'center', marginHorizontal: 4 },
+  broadcastButton: { backgroundColor: colors.warning },
+  newChatButton:   { backgroundColor: colors.success },
+  askMeshButton:   { backgroundColor: colors.accent },
+  actionButtonText: { color: colors.onColor, fontSize: 14, fontWeight: '600' },
+
+  // Search
+  searchRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 4,
-    elevation: 3,
+    backgroundColor: colors.surface,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.border,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
   },
-  unreadConversation: {
-    backgroundColor: '#F0F8FF',
-    borderLeftWidth: 4,
-    borderLeftColor: '#007AFF',
-  },
-  avatar: {
-    width: 50,
-    height: 50,
-    borderRadius: 25,
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginRight: 12,
-    position: 'relative',
-  },
-  avatarBroadcast: { backgroundColor: '#FF9500' },
-  avatarDirect:    { backgroundColor: '#007AFF' },
-  avatarText: {
-    fontSize: 16,
-    fontWeight: '700',
-    color: 'white',
-  },
-  avatarBadge: {
-    position: 'absolute',
-    top: -5,
-    right: -5,
-    backgroundColor: '#FF3B30',
-    borderRadius: 10,
-    minWidth: 20,
-    height: 20,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  avatarBadgeText: {
-    color: 'white',
-    fontSize: 10,
-    fontWeight: 'bold',
-  },
-  conversationInfo: {
+  searchInput: {
     flex: 1,
+    backgroundColor: colors.surfaceVariant,
+    borderRadius: 10,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    fontSize: 15,
+    color: colors.text,
   },
-  conversationHeader: {
+  searchClearBtn: { paddingHorizontal: 10, paddingVertical: 6 },
+  searchClearText: { fontSize: 16, color: colors.textMuted },
+  searchLoadingRow: {
+    flexDirection: 'row', alignItems: 'center',
+    justifyContent: 'center', padding: 20, gap: 10,
+  },
+  searchLoadingText: { fontSize: 14, color: colors.textSecondary },
+
+  // Search result card
+  searchResultCard: {
+    backgroundColor: colors.surface,
+    borderRadius: 12,
+    padding: 14,
+    marginBottom: 10,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.07,
+    shadowRadius: 3,
+    elevation: 2,
+  },
+  searchResultHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
     marginBottom: 4,
   },
-  conversationName: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#333',
-    flex: 1,
+  searchResultFrom: { fontSize: 13, fontWeight: '700', color: colors.primary, flex: 1 },
+  searchResultTime: { fontSize: 11, color: colors.textMuted, marginLeft: 8 },
+  searchResultText: { fontSize: 14, color: colors.textSecondary, lineHeight: 19 },
+
+  // Conversation list
+  list: { padding: 14, paddingBottom: 32 },
+  conversationCard: {
+    backgroundColor: colors.surface,
+    borderRadius: 12, padding: 14,
+    marginBottom: 10, flexDirection: 'row', alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.08, shadowRadius: 3, elevation: 2,
   },
-  conversationTime: {
-    fontSize: 12,
-    color: '#999',
-    marginLeft: 8,
+  unreadConversation: {
+    backgroundColor: colors.unreadHighlight,
+    borderLeftWidth: 4,
+    borderLeftColor: colors.unreadBorder,
   },
-  lastMessage: {
-    fontSize: 14,
-    color: '#666',
-    lineHeight: 18,
+  avatar: {
+    width: 50, height: 50, borderRadius: 25,
+    justifyContent: 'center', alignItems: 'center',
+    marginRight: 12, position: 'relative',
   },
-  unreadLastMessage: {
-    color: '#333',
-    fontWeight: '500',
+  avatarBroadcast: { backgroundColor: colors.avatarBroadcastBg },
+  avatarDirect:    { backgroundColor: colors.avatarDirectBg },
+  avatarText:      { fontSize: 16, fontWeight: '700', color: colors.onColor },
+  avatarBadge: {
+    position: 'absolute', top: -5, right: -5,
+    backgroundColor: colors.error,
+    borderRadius: 10, minWidth: 20, height: 20,
+    justifyContent: 'center', alignItems: 'center',
   },
+  avatarBadgeText: { color: colors.onColor, fontSize: 10, fontWeight: 'bold' },
+  conversationInfo:   { flex: 1 },
+  conversationHeader: {
+    flexDirection: 'row', justifyContent: 'space-between',
+    alignItems: 'center', marginBottom: 4,
+  },
+  conversationName: { fontSize: 16, fontWeight: '600', color: colors.text, flex: 1 },
+  conversationTime: { fontSize: 12, color: colors.textMuted, marginLeft: 8 },
+  lastMessage:      { fontSize: 14, color: colors.textSecondary, lineHeight: 18 },
+  unreadLastMessage: { color: colors.text, fontWeight: '500' },
+
+  // Empty state
   emptyState: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    padding: 40,
-    marginTop: 60,
+    flex: 1, justifyContent: 'center', alignItems: 'center',
+    padding: 40, marginTop: 60,
   },
   emptyIconCircle: {
-    width: 64,
-    height: 64,
-    borderRadius: 32,
-    backgroundColor: '#E0E0E0',
-    marginBottom: 16,
+    width: 64, height: 64, borderRadius: 32,
+    backgroundColor: colors.emptyCircle, marginBottom: 16,
   },
-  emptyText: {
-    fontSize: 18,
-    fontWeight: '600',
-    color: '#333',
-    marginBottom: 8,
-    textAlign: 'center',
+  emptyText:    { fontSize: 18, fontWeight: '600', color: colors.text, marginBottom: 8, textAlign: 'center' },
+  emptySubtext: { fontSize: 14, color: colors.textMuted, textAlign: 'center', marginBottom: 24, lineHeight: 20 },
+  emptyButton:  { backgroundColor: colors.primary, paddingHorizontal: 24, paddingVertical: 12, borderRadius: 8 },
+  emptyButtonText: { color: colors.onColor, fontSize: 16, fontWeight: '600' },
+
+  // First-launch name modal
+  modalOverlay: {
+    flex: 1, backgroundColor: 'rgba(0,0,0,0.55)',
+    justifyContent: 'center', alignItems: 'center', padding: 32,
   },
-  emptySubtext: {
-    fontSize: 14,
-    color: '#999',
-    textAlign: 'center',
-    marginBottom: 24,
-    lineHeight: 20,
+  modalCard: {
+    width: '100%', backgroundColor: colors.surface,
+    borderRadius: 16, padding: 24,
   },
-  emptyButton: {
-    backgroundColor: '#007AFF',
-    paddingHorizontal: 24,
-    paddingVertical: 12,
-    borderRadius: 8,
+  modalTitle:    { fontSize: 22, fontWeight: '700', color: colors.text, marginBottom: 8 },
+  modalSubtitle: { fontSize: 14, color: colors.textMuted, marginBottom: 20, lineHeight: 20 },
+  modalInput: {
+    backgroundColor: colors.surfaceVariant,
+    borderRadius: 8, borderWidth: 1, borderColor: colors.border,
+    paddingHorizontal: 14, paddingVertical: 12,
+    fontSize: 16, color: colors.text, marginBottom: 16,
   },
-  emptyButtonText: {
-    color: 'white',
-    fontSize: 16,
-    fontWeight: '600',
+  modalBtn: {
+    backgroundColor: colors.primary, borderRadius: 8,
+    paddingVertical: 13, alignItems: 'center',
   },
+  modalBtnDisabled: { backgroundColor: colors.border },
+  modalBtnText: { color: '#fff', fontWeight: '700', fontSize: 16 },
 });
 
 export default HomeScreen;

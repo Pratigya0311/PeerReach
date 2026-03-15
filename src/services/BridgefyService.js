@@ -4,23 +4,28 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import databaseService from './DatabaseService';
 import gatewayService from './GatewayService';
 
+const DISPLAY_NAME_KEY = '@peerreach_display_name';
+
 const { Bridgefy } = NativeModules;
-const bridgefyEmitter = new NativeEventEmitter(Bridgefy);
+
+if (!Bridgefy) {
+  console.error('❌ Bridgefy native module is NULL — the .aar may not have loaded correctly');
+}
+
+const bridgefyEmitter = Bridgefy ? new NativeEventEmitter(Bridgefy) : { addListener: () => ({}) };
 
 class BridgefyService {
   constructor() {
-    this.deviceListListener = null;
     this.messageListener = null;
-    this.backgroundMessageHandler = null;
     this.connectedDevices = new Map();
     this.myDeviceId = null;
-    this.myDeviceName = Platform.OS === 'android' ? Bridgefy.deviceName || 'Android Device' : 'iOS Device';
+    this.myDeviceName = Platform.OS === 'android' ? (Bridgefy?.deviceName || 'Android Device') : 'iOS Device';
     this.isInitialized = false;
     this.isInitializing = false;
     this.currentChatId = null;
-    this.useAsyncStorage = false;
-    // Initialize database
+    // Initialize database and load saved display name
     this.initializeDatabase();
+    this._loadDisplayName();
 
     // Wire up gateway service
     gatewayService.init(this);
@@ -29,100 +34,119 @@ class BridgefyService {
     this.setupEventListeners();
     
     // Listen for app state changes
-    AppState.addEventListener('change', this.handleAppStateChange.bind(this));
+    this._appStateHandler = this.handleAppStateChange.bind(this);
+    this._appStateSubscription = AppState.addEventListener('change', this._appStateHandler);
   }
 
   async initializeDatabase() {
     try {
       await databaseService.initialize();
-      this.useAsyncStorage = false;
       console.log('✅ Database ready');
     } catch (error) {
-      console.error('❌ Database initialization failed, using AsyncStorage fallback:', error);
-      this.useAsyncStorage = true;
+      console.error('❌ Database initialization failed:', error);
     }
   }
 
   setupEventListeners() {
     // Registration events
     bridgefyEmitter.addListener('onRegistrationSuccessful', async (data) => {
-      console.log('✅ Bridgefy registered:', data);
-      this.myDeviceId = data.userUuid;
-      this.myDeviceName = data.deviceName || this.myDeviceName;
-      this.isInitialized = true;
-      gatewayService.setMyDeviceId(this.myDeviceId);
-      
-      // Save my own device to database
-      await databaseService.saveDevice({
-        id: this.myDeviceId,
-        name: this.myDeviceName,
-        connection_status: 'online'
-      });
-      
-      this.emitEvent('onReady', { deviceId: this.myDeviceId, deviceName: this.myDeviceName });
+      try {
+        console.log('✅ Bridgefy registered:', data);
+        this.myDeviceId = data.userUuid;
+        // Use hardware name as fallback only; custom display name takes priority
+        const hwName = data.deviceName || this.myDeviceName;
+        const saved = await AsyncStorage.getItem(DISPLAY_NAME_KEY).catch(() => null);
+        this.myDeviceName = (saved && saved.trim()) ? saved.trim() : hwName;
+        this.isInitialized = true;
+        gatewayService.setMyDeviceId(this.myDeviceId);
+        await databaseService.saveDevice({
+          id: this.myDeviceId,
+          name: this.myDeviceName,
+          connection_status: 'online'
+        });
+        this.emitEvent('onReady', { deviceId: this.myDeviceId, deviceName: this.myDeviceName });
+      } catch (err) {
+        console.error('❌ onRegistrationSuccessful error:', err);
+        // Still emit ready even if DB save fails — mesh can work without it
+        this.emitEvent('onReady', { deviceId: this.myDeviceId, deviceName: this.myDeviceName });
+      }
     });
 
     // Device connection events
     bridgefyEmitter.addListener('onDeviceConnected', async (device) => {
-      console.log('📱 Device connected:', device);
-      if (device.userId) {
-        this.connectedDevices.set(device.userId, device.deviceName || `Device_${device.userId.substring(0, 8)}`);
-        
-        // Save to database
-        await databaseService.saveDevice({
-          id: device.userId,
-          name: device.deviceName || `Device_${device.userId.substring(0, 8)}`,
-          connection_status: 'online'
-        });
-        
-        this.emitEvent('onDeviceConnected', device);
+      try {
+        console.log('📱 Device connected:', device);
+        if (device.userId) {
+          this.connectedDevices.set(device.userId, device.deviceName || `Device_${device.userId.substring(0, 8)}`);
+          await databaseService.saveDevice({
+            id: device.userId,
+            name: device.deviceName || `Device_${device.userId.substring(0, 8)}`,
+            connection_status: 'online'
+          });
+          this.emitEvent('onDeviceConnected', device);
+        }
+      } catch (err) {
+        console.error('❌ onDeviceConnected error:', err);
       }
     });
 
     bridgefyEmitter.addListener('onDeviceLost', async (device) => {
-      console.log('📱 Device lost:', device);
-      if (device.userId) {
-        this.connectedDevices.delete(device.userId);
-        
-        // Update status in database
-        await databaseService.updateDeviceStatus(device.userId, 'offline');
-        
-        this.emitEvent('onDeviceLost', device);
+      try {
+        console.log('📱 Device lost:', device);
+        if (device.userId) {
+          this.connectedDevices.delete(device.userId);
+          await databaseService.updateDeviceStatus(device.userId, 'offline');
+          this.emitEvent('onDeviceLost', device);
+        }
+      } catch (err) {
+        console.error('❌ onDeviceLost error:', err);
       }
     });
 
     // Message events
     bridgefyEmitter.addListener('onMessageReceived', async (rawMessage) => {
-      console.log('📨 Direct message received:', rawMessage);
-      await this.handleIncomingMessage(rawMessage, false);
+      try {
+        console.log('📨 Direct message received:', rawMessage);
+        await this.handleIncomingMessage(rawMessage, false);
+      } catch (err) {
+        console.error('❌ onMessageReceived error:', err);
+      }
     });
 
     bridgefyEmitter.addListener('onBroadcastMessageReceived', async (rawMessage) => {
-      console.log('📢 Broadcast message received:', rawMessage);
-      await this.handleIncomingMessage(rawMessage, true);
+      try {
+        console.log('📢 Broadcast message received:', rawMessage);
+        await this.handleIncomingMessage(rawMessage, true);
+      } catch (err) {
+        console.error('❌ onBroadcastMessageReceived error:', err);
+      }
     });
 
     bridgefyEmitter.addListener('onRegistrationFailed', (error) => {
-      console.error('âŒ Bridgefy registration failed:', error);
+      console.warn("⚠️ Bridgefy registration failed:", error);
       this.emitEvent('onError', error);
     });
 
     bridgefyEmitter.addListener('onDeviceListUpdated', async (data) => {
-      console.log('ðŸ“± Device list updated:', data?.devices?.length);
-      if (data?.devices && Array.isArray(data.devices)) {
-        for (const device of data.devices) {
-          if (device.id && device.name) {
-            this.connectedDevices.set(device.id, device.name);
-            await databaseService.saveDevice({
-              id: device.id,
-              name: device.name,
-              connection_status: 'online'
-            });
+      try {
+        console.log('ðŸ”± Device list updated:', data?.devices?.length);
+        if (data?.devices && Array.isArray(data.devices)) {
+          for (const device of data.devices) {
+            if (device.id && device.name) {
+              this.connectedDevices.set(device.id, device.name);
+              await databaseService.saveDevice({
+                id: device.id,
+                name: device.name,
+                connection_status: 'online'
+              });
+            }
           }
+          this.emitEvent('onDeviceListUpdated', {
+            devices: Array.from(this.connectedDevices.entries()).map(([id, name]) => ({ id, name }))
+          });
         }
-        this.emitEvent('onDeviceListUpdated', {
-          devices: Array.from(this.connectedDevices.entries()).map(([id, name]) => ({ id, name }))
-        });
+      } catch (err) {
+        console.error('❌ onDeviceListUpdated error:', err);
       }
     });
 
@@ -154,16 +178,25 @@ class BridgefyService {
 
   async handleIncomingMessage(rawMessage, isBroadcast) {
     try {
-      // Intercept gateway protocol messages — don't save to chat DB
-      if (rawMessage.content) {
+      const rawContent = rawMessage.content || '';
+
+      // Intercept protocol messages — don't save to chat DB
+      if (rawContent) {
         try {
-          const parsed = JSON.parse(rawMessage.content);
+          const parsed = JSON.parse(rawContent);
           if (
             parsed.type === 'internet_request' ||
             parsed.type === 'internet_response' ||
             parsed.type === 'cache_share'
           ) {
             await gatewayService.handleIncomingGatewayMessage(parsed, rawMessage.senderId);
+            return;
+          }
+          // Typing indicator — ephemeral, never stored
+          if (parsed.type === 'typing') {
+            const senderId = rawMessage.senderId || parsed.senderId;
+            const senderName = parsed.senderName || this.connectedDevices.get(senderId) || 'Someone';
+            this.emitEvent('onTyping', { senderId, senderName, isBroadcast });
             return;
           }
         } catch {
@@ -174,11 +207,24 @@ class BridgefyService {
       const messageType = isBroadcast ? 'broadcast' : 'direct';
       const senderId = rawMessage.senderId || 'unknown';
       const senderName = rawMessage.senderName || this.connectedDevices.get(senderId) || 'Unknown Device';
-      
-      // Create database message object
+
+      // Detect photo / location content types
+      let contentType = 'text';
+      let mediaData = null;
+      if (rawContent.startsWith('{')) {
+        try {
+          const parsed = JSON.parse(rawContent);
+          if (parsed.type === 'photo' || parsed.type === 'location') {
+            contentType = parsed.type;
+            mediaData = parsed;
+          }
+        } catch (_e) { /* not JSON */ }
+      }
+
+      // Create database message object — store full JSON for photo/location
       const dbMessage = {
-        id: rawMessage.messageId || `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-        content: rawMessage.content || '',
+        id: rawMessage.messageId || `msg_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`,
+        content: rawContent,
         sender_id: senderId,
         sender_name: senderName,
         receiver_id: isBroadcast ? null : this.myDeviceId,
@@ -186,24 +232,26 @@ class BridgefyService {
         is_mine: false,
         is_broadcast: isBroadcast,
         timestamp: parseInt(rawMessage.timestamp) || Date.now(),
-        read_status: 0, // unread
+        read_status: 0,
         delivery_status: 'delivered'
       };
 
       // Save to database
       const savedMessage = await databaseService.saveMessage(dbMessage);
-      
+
       // Convert to app message format
       const message = {
         id: savedMessage.id,
-        text: savedMessage.content,
+        text: mediaData?.text || rawContent,
+        contentType,
+        mediaData,
         senderId: savedMessage.sender_id,
         senderName: savedMessage.sender_name,
         receiverId: savedMessage.receiver_id,
         timestamp: savedMessage.timestamp,
         isMine: false,
         isBroadcast: isBroadcast,
-        type: 'text',
+        type: messageType,
         read: false
       };
 
@@ -239,15 +287,16 @@ class BridgefyService {
   }
 
   showNotification(message) {
-    console.log(
-      `ðŸ”” NEW ${message.isBroadcast ? 'BROADCAST' : 'MESSAGE'} from ${message.senderName}: ${message.text.substring(0, 50)}...`
-    );
+    const preview = (message.text || `[${message.contentType || 'message'}]`).substring(0, 50);
+    console.log(`ðŸ”” NEW ${message.isBroadcast ? 'BROADCAST' : 'MESSAGE'} from ${message.senderName}: ${preview}...`);
   }
 
   handleAppStateChange(nextState) {
     // Pause background work when not active; refresh unread counts on resume.
     if (nextState === 'active') {
-      this.emitEvent('onUnreadUpdated', this.getUnreadCounts());
+      this.getUnreadCounts()
+        .then(counts => this.emitEvent('onUnreadUpdated', counts))
+        .catch(err => console.error('❌ getUnreadCounts error:', err));
       return;
     }
 
@@ -258,10 +307,62 @@ class BridgefyService {
     }
   }
 
+  // ============ PRIVATE HELPERS ============
+
+  // Builds the DB row for any outbound message.
+  _buildDbMessage({ responseId, content, receiverId = null, messageType, isBroadcast = false, replyToId = null, replyPreview = null }) {
+    const prefix = isBroadcast ? 'broadcast' : 'sent';
+    return {
+      id: responseId || `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`,
+      content,
+      sender_id: this.myDeviceId,
+      sender_name: this.myDeviceName,
+      receiver_id: receiverId,
+      message_type: messageType,
+      is_mine: true,
+      is_broadcast: isBroadcast,
+      timestamp: Date.now(),
+      read_status: 1,
+      delivery_status: 'sent',
+      reply_to_id: replyToId,
+      reply_preview: replyPreview,
+    };
+  }
+
+  // Converts a saved DB row back to the app message format used by screens.
+  _buildAppMessage(dbMsg, { contentType = 'text', mediaData = null, text = null } = {}) {
+    // For photo/location the content is a JSON blob — extract the human-readable text field.
+    let resolvedText = text;
+    if (!resolvedText) {
+      if (contentType !== 'text' && dbMsg.content && dbMsg.content.startsWith('{')) {
+        try { resolvedText = JSON.parse(dbMsg.content).text || dbMsg.content; } catch (_e) { resolvedText = dbMsg.content; }
+      } else {
+        resolvedText = dbMsg.content;
+      }
+    }
+    return {
+      id: dbMsg.id,
+      text: resolvedText,
+      contentType,
+      mediaData,
+      senderId: dbMsg.sender_id,
+      senderName: dbMsg.sender_name,
+      receiverId: dbMsg.receiver_id,
+      timestamp: dbMsg.timestamp,
+      isMine: true,
+      isBroadcast: dbMsg.is_broadcast,
+      type: dbMsg.message_type,
+      read: true,
+      replyToId: dbMsg.reply_to_id || null,
+      replyPreview: dbMsg.reply_preview || null,
+    };
+  }
+
   // ============ PUBLIC API ============
 
   async initialize(apiKey) {
     console.log('Initializing Bridgefy with SQLite...');
+    if (!Bridgefy) throw new Error('Bridgefy native module not loaded. Check that the AAR is properly linked.');
     try {
       if (this.isInitialized || this.isInitializing) {
         return true;
@@ -277,49 +378,103 @@ class BridgefyService {
     }
   }
 
-  async sendMessage(receiverId, text) {
+  async sendMessage(receiverId, text, replyTo = null) {
+    if (!this.myDeviceId) throw new Error('Mesh not ready — please wait for initialization');
     try {
       console.log(`📤 Sending to ${receiverId}: ${text}`);
       const response = await Bridgefy.sendMessage(receiverId, text);
-      
-      // Create database message
-      const dbMessage = {
-        id: response.id || `sent_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      const dbMsg = this._buildDbMessage({
+        responseId: response.id,
         content: text,
-        sender_id: this.myDeviceId,
-        sender_name: this.myDeviceName,
-        receiver_id: receiverId,
-        message_type: 'direct',
-        is_mine: true,
-        is_broadcast: false,
-        timestamp: Date.now(),
-        read_status: 1, // sent messages are read
-        delivery_status: 'sent'
-      };
-
-      // Save to database
-      await databaseService.saveMessage(dbMessage);
-      
-      // Return app format message
-      return {
-        id: dbMessage.id,
-        text: text,
-        senderId: this.myDeviceId,
-        senderName: this.myDeviceName,
-        receiverId: receiverId,
-        timestamp: Date.now(),
-        isMine: true,
-        isBroadcast: false,
-        type: 'text',
-        read: true
-      };
+        receiverId,
+        messageType: 'direct',
+        replyToId: replyTo?.id || null,
+        replyPreview: replyTo ? `${replyTo.senderName}: ${replyTo.text}` : null,
+      });
+      await databaseService.saveMessage(dbMsg);
+      return this._buildAppMessage(dbMsg);
     } catch (error) {
       console.error('❌ Send message failed:', error);
       throw error;
     }
   }
 
-  async sendBroadcast(text) {
+  async sendPhoto(receiverId, base64Data, width, height) {
+    if (!this.myDeviceId) throw new Error('Mesh not ready — please wait for Bridgefy to initialize');
+    try {
+      const payload = JSON.stringify({
+        type: 'photo', text: '[Photo]',
+        senderId: this.myDeviceId, senderName: this.myDeviceName,
+        timestamp: Date.now(), isBroadcast: false,
+        data: base64Data, width, height,
+      });
+      const response = await Bridgefy.sendPayload(receiverId, payload);
+      const dbMsg = this._buildDbMessage({ responseId: response.id, content: payload, receiverId, messageType: 'direct' });
+      await databaseService.saveMessage(dbMsg);
+      return this._buildAppMessage(dbMsg, { contentType: 'photo', mediaData: { data: base64Data, width, height } });
+    } catch (error) {
+      console.error('❌ Send photo failed:', error);
+      throw error;
+    }
+  }
+
+  async sendLocation(receiverId, lat, lng) {
+    if (!this.myDeviceId) throw new Error('Mesh not ready — please wait for Bridgefy to initialize');
+    try {
+      const payload = JSON.stringify({
+        type: 'location', text: '[Location]',
+        senderId: this.myDeviceId, senderName: this.myDeviceName,
+        timestamp: Date.now(), isBroadcast: false, lat, lng,
+      });
+      const response = await Bridgefy.sendPayload(receiverId, payload);
+      const dbMsg = this._buildDbMessage({ responseId: response.id, content: payload, receiverId, messageType: 'direct' });
+      await databaseService.saveMessage(dbMsg);
+      return this._buildAppMessage(dbMsg, { contentType: 'location', mediaData: { lat, lng } });
+    } catch (error) {
+      console.error('❌ Send location failed:', error);
+      throw error;
+    }
+  }
+
+  async sendBroadcastPhoto(base64Data, width, height) {
+    if (!this.myDeviceId) throw new Error('Mesh not ready — please wait for Bridgefy to initialize');
+    try {
+      const payload = JSON.stringify({
+        type: 'photo', text: '[Photo]',
+        senderId: this.myDeviceId, senderName: this.myDeviceName,
+        timestamp: Date.now(), isBroadcast: true,
+        data: base64Data, width, height,
+      });
+      const response = await Bridgefy.sendBroadcastPayload(payload);
+      const dbMsg = this._buildDbMessage({ responseId: response.id, content: payload, messageType: 'broadcast', isBroadcast: true });
+      await databaseService.saveMessage(dbMsg);
+      return this._buildAppMessage(dbMsg, { contentType: 'photo', mediaData: { data: base64Data, width, height } });
+    } catch (error) {
+      console.error('❌ Broadcast photo failed:', error);
+      throw error;
+    }
+  }
+
+  async sendBroadcastLocation(lat, lng) {
+    if (!this.myDeviceId) throw new Error('Mesh not ready — please wait for Bridgefy to initialize');
+    try {
+      const payload = JSON.stringify({
+        type: 'location', text: '[Location]',
+        senderId: this.myDeviceId, senderName: this.myDeviceName,
+        timestamp: Date.now(), isBroadcast: true, lat, lng,
+      });
+      const response = await Bridgefy.sendBroadcastPayload(payload);
+      const dbMsg = this._buildDbMessage({ responseId: response.id, content: payload, messageType: 'broadcast', isBroadcast: true });
+      await databaseService.saveMessage(dbMsg);
+      return this._buildAppMessage(dbMsg, { contentType: 'location', mediaData: { lat, lng } });
+    } catch (error) {
+      console.error('❌ Broadcast location failed:', error);
+      throw error;
+    }
+  }
+
+  async sendBroadcast(text, replyTo = null) {
+    if (!this.myDeviceId) throw new Error('Mesh not ready — please wait for initialization');
     try {
       // Gateway protocol messages: send over BLE but never save to chat DB
       try {
@@ -330,7 +485,20 @@ class BridgefyService {
           parsed.type === 'cache_share'
         ) {
           await Bridgefy.sendBroadcast(text);
-          return { id: null };
+          return {
+            id: `gw_${Date.now()}`,
+            text: '',
+            contentType: 'text',
+            mediaData: null,
+            senderId: this.myDeviceId,
+            senderName: this.myDeviceName,
+            timestamp: Date.now(),
+            isMine: true,
+            isBroadcast: true,
+            type: 'broadcast',
+            read: true,
+            isGatewayProtocol: true,
+          };
         }
       } catch (_e) {
         // Not JSON — regular chat broadcast, fall through
@@ -338,36 +506,16 @@ class BridgefyService {
 
       console.log(`📢 Broadcasting: ${text}`);
       const response = await Bridgefy.sendBroadcast(text);
-      
-      // Create database message
-      const dbMessage = {
-        id: response.id || `broadcast_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      const dbMsg = this._buildDbMessage({
+        responseId: response.id,
         content: text,
-        sender_id: this.myDeviceId,
-        sender_name: this.myDeviceName,
-        receiver_id: null,
-        message_type: 'broadcast',
-        is_mine: true,
-        is_broadcast: true,
-        timestamp: Date.now(),
-        read_status: 1,
-        delivery_status: 'sent'
-      };
-
-      // Save to database
-      await databaseService.saveMessage(dbMessage);
-      
-      return {
-        id: dbMessage.id,
-        text: text,
-        senderId: this.myDeviceId,
-        senderName: this.myDeviceName,
-        timestamp: Date.now(),
-        isMine: true,
+        messageType: 'broadcast',
         isBroadcast: true,
-        type: 'text',
-        read: true
-      };
+        replyToId: replyTo?.id || null,
+        replyPreview: replyTo ? `${replyTo.senderName}: ${replyTo.text}` : null,
+      });
+      await databaseService.saveMessage(dbMsg);
+      return this._buildAppMessage(dbMsg);
     } catch (error) {
       console.error('❌ Broadcast failed:', error);
       throw error;
@@ -476,56 +624,64 @@ class BridgefyService {
     }
   }
 
-  async getDatabaseStats() {
+  async searchMessages(query) {
     try {
-      const messageCount = await databaseService.getMessageCount();
-      const dbSize = await databaseService.getDatabaseSize();
-      const conversations = await databaseService.getConversations();
-      
-      return {
-        messageCount,
-        dbSizeBytes: dbSize,
-        dbSizeMB: (dbSize / (1024 * 1024)).toFixed(2),
-        conversationCount: conversations.length,
-        deviceCount: this.connectedDevices.size
-      };
+      return await databaseService.searchMessages(query);
     } catch (error) {
-      console.error('❌ Error getting database stats:', error);
-      return null;
+      console.error('❌ Search failed:', error);
+      return [];
     }
   }
 
-  async saveMessageToStorage(message) {
-    if (!this.useAsyncStorage) {
-      try {
-        return await databaseService.saveMessage(message);
-      } catch (error) {
-        console.error('Database save failed, falling back to AsyncStorage:', error);
-        this.useAsyncStorage = true;
+  async deleteMessage(messageId) {
+    return databaseService.deleteMessage(messageId);
+  }
+
+  async pinMessage(messageId, pinned) {
+    return databaseService.pinMessage(messageId, pinned);
+  }
+
+  async getPinnedMessages(conversationId, isBroadcast) {
+    return databaseService.getPinnedMessages(conversationId, isBroadcast);
+  }
+
+  async getMediaMessages(conversationId, isBroadcast) {
+    return databaseService.getMediaMessages(conversationId, isBroadcast);
+  }
+
+  async clearChat(conversationId, isBroadcast) {
+    return databaseService.deleteConversation(conversationId, isBroadcast ? 'broadcast' : 'direct');
+  }
+
+  async sendTypingIndicator(receiverId, isBroadcast) {
+    if (!this.myDeviceId) return;
+    try {
+      const payload = JSON.stringify({ type: 'typing', senderId: this.myDeviceId, senderName: this.myDeviceName });
+      if (isBroadcast) {
+        await Bridgefy.sendBroadcast(payload);
+      } else {
+        await Bridgefy.sendPayload(receiverId, payload);
       }
-    }
-    
-    // AsyncStorage fallback
-    return this.saveMessageToAsyncStorage(message);
+    } catch (_e) { /* typing failures are silent */ }
   }
 
-  async saveMessageToAsyncStorage(message) {
-    // Your existing AsyncStorage logic
+  setOnTypingHandler(callback) { this.onTypingHandler = callback; }
+
+  async _loadDisplayName() {
     try {
-      const key = message.isBroadcast ? '@broadcast_messages' : `@messages_${message.senderId}`;
-      const existing = await AsyncStorage.getItem(key);
-      const messages = existing ? JSON.parse(existing) : [];
-      messages.unshift(message);
-      await AsyncStorage.setItem(key, JSON.stringify(messages.slice(0, 1000)));
-      return message;
-    } catch (error) {
-      console.error('AsyncStorage save failed:', error);
-      throw error;
-    }
+      const saved = await AsyncStorage.getItem(DISPLAY_NAME_KEY);
+      if (saved && saved.trim()) this.myDeviceName = saved.trim();
+    } catch (_e) {}
   }
 
+  async setDisplayName(name) {
+    const trimmed = (name || '').trim();
+    if (!trimmed) return;
+    await AsyncStorage.setItem(DISPLAY_NAME_KEY, trimmed);
+    this.myDeviceName = trimmed;
+  }
 
-  // ... rest of the methods remain the same (getMyDeviceId, getMyDeviceName, etc.)
+  getDisplayName() { return this.myDeviceName; }
 
   setCurrentChat(deviceId) {
     this.currentChatId = deviceId;
@@ -545,6 +701,12 @@ class BridgefyService {
 
   async getMyDeviceName() {
     try {
+      // Custom display name always wins over hardware name
+      const custom = await AsyncStorage.getItem(DISPLAY_NAME_KEY).catch(() => null);
+      if (custom && custom.trim()) {
+        this.myDeviceName = custom.trim();
+        return this.myDeviceName;
+      }
       const name = await Bridgefy.getMyDeviceName();
       if (name) {
         this.myDeviceName = name;
@@ -556,7 +718,6 @@ class BridgefyService {
   }
 
   setDeviceListListener(callback) {
-    this.deviceListListener = callback;
     this.onDeviceListUpdatedHandler = callback;
   }
 
@@ -588,6 +749,11 @@ class BridgefyService {
 
   async stop() {
     try {
+      if (this._appStateSubscription) {
+        this._appStateSubscription.remove();
+        this._appStateSubscription = null;
+      }
+      gatewayService.destroy();
       await Bridgefy.stop();
       await databaseService.close();
       this.isInitialized = false;

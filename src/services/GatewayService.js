@@ -58,9 +58,12 @@ class GatewayService {
       try {
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 4000);
-        const res = await fetch(url, { method: 'HEAD', signal: controller.signal });
-        clearTimeout(timeout);
-        if (res.status === 204) return true;
+        try {
+          const res = await fetch(url, { method: 'HEAD', signal: controller.signal });
+          if (res.status === 204) return true;
+        } finally {
+          clearTimeout(timeout);
+        }
       } catch (_e) {
         // This URL failed — try the next one
       }
@@ -142,7 +145,6 @@ class GatewayService {
       const extractUrl =
         `https://en.wikipedia.org/w/api.php?action=query&prop=extracts&exsentences=3&exintro=1&explaintext=1&titles=${encodeURIComponent(title)}&format=json&utf8=1&origin=*`;
       const extractRes = await fetch(extractUrl, { signal: controller.signal });
-      clearTimeout(timeout);
       const extractJson = await extractRes.json();
       const pages = extractJson?.query?.pages;
       if (!pages) throw new Error('No Wikipedia extract');
@@ -157,7 +159,7 @@ class GatewayService {
   }
 
   async _fetchWeather(location) {
-    // wttr.in returns a single compact line e.g. "Bangalore: ⛅ +28°C"
+    // wttr.in returns a single compact line e.g. "Bangalore: +28C"
     // format=3 is the shortest format — well within BLE payload limits.
     // No location (or 'auto') → omit the path segment so wttr.in uses IP-based detection.
     const weatherUrl =
@@ -253,7 +255,7 @@ class GatewayService {
 
     // No internet — broadcast request through the mesh
     return new Promise((resolve, reject) => {
-      const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+      const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
       const timer = setTimeout(() => {
         this.pendingRequests.delete(requestId);
@@ -285,7 +287,7 @@ class GatewayService {
 
   // ── Called by BridgefyService when a gateway-type message arrives ───────────
 
-  async handleIncomingGatewayMessage(parsed, senderId) {
+  async handleIncomingGatewayMessage(parsed, _senderId) {
     if (parsed.type === 'internet_request') {
       await this._handleRequest(parsed);
     } else if (parsed.type === 'internet_response') {
