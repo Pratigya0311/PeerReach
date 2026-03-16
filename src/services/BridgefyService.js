@@ -6,6 +6,10 @@ import databaseService from './DatabaseService';
 const { Bridgefy } = NativeModules;
 const bridgefyEmitter = new NativeEventEmitter(Bridgefy);
 
+const ANNOUNCE_INTERVAL_MS = 90000;
+const ANNOUNCE_TTL_MS = 180000;
+const MAX_HOPS = 5;
+
 class BridgefyService {
   constructor() {
     this.deviceListListener = null;
@@ -18,6 +22,13 @@ class BridgefyService {
     this.isInitializing = false;
     this.currentChatId = null;
     this.useAsyncStorage = false;
+    this.seenAnnounces = new Map();
+    this.announceTimer = null;
+    this.sendCooldowns = new Map();
+    this.pendingSendMap = new Map();
+    this.lastApiKey = null;
+    this.healthTimer = null;
+    this.isRestarting = false;
     // Initialize database
     this.initializeDatabase();
     
@@ -53,6 +64,10 @@ class BridgefyService {
         name: this.myDeviceName,
         connection_status: 'online'
       });
+
+      this.startAnnounceLoop();
+      this.sendAnnounce('online', 0);
+      this.flushQueuedMessages();
       
       this.emitEvent('onReady', { deviceId: this.myDeviceId, deviceName: this.myDeviceName });
     });
@@ -69,6 +84,9 @@ class BridgefyService {
           name: device.deviceName || `Device_${device.userId.substring(0, 8)}`,
           connection_status: 'online'
         });
+
+      this.sendAnnounce('online', 0);
+      this.flushQueuedMessages();
         
         this.emitEvent('onDeviceConnected', device);
       }
@@ -81,6 +99,7 @@ class BridgefyService {
         
         // Update status in database
         await databaseService.updateDeviceStatus(device.userId, 'offline');
+        await databaseService.markKnownUsersStaleByViaPeer(device.userId);
         
         this.emitEvent('onDeviceLost', device);
       }
@@ -122,12 +141,21 @@ class BridgefyService {
     });
 
     bridgefyEmitter.addListener('onMessageSent', (data) => {
-      console.log('âœ… Message sent:', data);
+      console.log('Message sent:', data);
+      if (data?.messageId) {
+        this.pendingSendMap.delete(data.messageId);
+      }
       this.emitEvent('onMessageSent', data);
     });
 
     bridgefyEmitter.addListener('onMessageSendFailed', (error) => {
-      console.error('âŒ Message send failed:', error);
+      console.error('Message send failed:', error);
+      const receiverId = error?.receiverId || (error?.messageId ? this.pendingSendMap.get(error.messageId) : null);
+      if (receiverId) {
+        this.applySendFailure(receiverId);
+      }
+      this.sendAnnounce('online', 0);
+      this.ensureHealth();
       this.emitEvent('onMessageSendFailed', error);
     });
 
@@ -142,13 +170,18 @@ class BridgefyService {
     });
 
     bridgefyEmitter.addListener('onStopped', () => {
-      console.log('ðŸ›‘ Bridgefy service stopped');
+      console.log('Bridgefy service stopped');
+      this.stopAnnounceLoop();
       this.emitEvent('onStopped', {});
     });
   }
 
   async handleIncomingMessage(rawMessage, isBroadcast) {
     try {
+      if (rawMessage && rawMessage.type === 'announce') {
+        await this.handleAnnounce(rawMessage);
+        return;
+      }
       const messageType = isBroadcast ? 'broadcast' : 'direct';
       const senderId = rawMessage.senderId || 'unknown';
       const senderName = rawMessage.senderName || this.connectedDevices.get(senderId) || 'Unknown Device';
@@ -215,7 +248,232 @@ class BridgefyService {
       console.error('❌ Error handling incoming message:', error);
     }
   }
+  startAnnounceLoop() {
+    if (this.announceTimer) return;
+    this.announceTimer = setInterval(async () => {
+      this.pruneAnnounces();
+      this.sendAnnounce('online', 0);
+      this.flushQueuedMessages();
+      await this.pruneKnownUsers();
+    }, ANNOUNCE_INTERVAL_MS);
+  }
 
+  stopAnnounceLoop() {
+    if (this.announceTimer) {
+      clearInterval(this.announceTimer);
+      this.announceTimer = null;
+    }
+  }
+
+  pruneAnnounces() {
+    const now = Date.now();
+    const maxAge = ANNOUNCE_TTL_MS * 2;
+    for (const [id, ts] of this.seenAnnounces.entries()) {
+      if (now - ts > maxAge) {
+        this.seenAnnounces.delete(id);
+      }
+    }
+  }
+
+  async pruneKnownUsers() {
+    try {
+      const expireBefore = Date.now() - ANNOUNCE_TTL_MS;
+      await databaseService.pruneKnownUsers(expireBefore);
+    } catch (error) {
+      console.error('Error pruning known users:', error);
+    }
+  }
+
+  async sendAnnounce(status, hop) {
+    try {
+      if (!this.isInitialized || !this.myDeviceId) return;
+      const announceId = `${this.myDeviceId}:${Date.now()}`;
+      const payload = {
+        type: 'announce',
+        text: '',
+        userId: this.myDeviceId,
+        userName: this.myDeviceName,
+        status: status,
+        hop: hop,
+        announceId: announceId,
+        ts: Date.now()
+      };
+      if (Bridgefy.sendBroadcastPayload) {
+        await Bridgefy.sendBroadcastPayload(JSON.stringify(payload));
+      }
+    } catch (error) {
+      console.error('Error sending announce:', error);
+      if (String(error?.message || '').includes('USER_NOT_INITIALIZED')) {
+        this.stopAnnounceLoop();
+      }
+    }
+  }
+
+  async handleAnnounce(rawMessage) {
+    try {
+      const announceId = rawMessage.announceId;
+      if (!announceId) return;
+      if (this.seenAnnounces.has(announceId)) return;
+      this.seenAnnounces.set(announceId, Date.now());
+
+      const userId = rawMessage.userId;
+      const userName = rawMessage.userName || 'Unknown Device';
+      const hop = parseInt(rawMessage.hop, 10) || 0;
+      const distance = hop + 1;
+      const senderId = rawMessage.senderId || null;
+      const status = rawMessage.status || 'online';
+
+      if (!userId || userId === this.myDeviceId) return;
+
+      await databaseService.upsertKnownUser({
+        id: userId,
+        name: userName,
+        last_seen: Date.now(),
+        hops: distance,
+        via_peer: senderId,
+        is_online: status === 'online' ? 1 : 0
+      });
+
+      if (distance < MAX_HOPS) {
+        const forwardPayload = {
+          type: 'announce',
+          text: '',
+          userId: userId,
+          userName: userName,
+          status: status,
+          hop: hop + 1,
+          announceId: announceId,
+          ts: rawMessage.ts || Date.now()
+        };
+        if (Bridgefy.sendBroadcastPayload) {
+          await Bridgefy.sendBroadcastPayload(JSON.stringify(forwardPayload));
+        }
+      }
+    } catch (error) {
+      console.error('Error handling announce:', error);
+    }
+  }
+  isInCooldown(receiverId) {
+    const until = this.sendCooldowns.get(receiverId);
+    return until && Date.now() < until;
+  }
+
+  applySendFailure(receiverId) {
+    const cooldownMs = 60000;
+    this.sendCooldowns.set(receiverId, Date.now() + cooldownMs);
+    databaseService.upsertKnownUser({
+      id: receiverId,
+      name: this.connectedDevices.get(receiverId) || 'Unknown Device',
+      last_seen: Date.now(),
+      hops: 0,
+      via_peer: null,
+      is_online: 0
+    }).catch(() => {});
+  }
+
+  async queueOutgoingMessage(receiverId, text) {
+    const dbMessage = {
+      id: `queued_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      content: text,
+      sender_id: this.myDeviceId,
+      sender_name: this.myDeviceName,
+      receiver_id: receiverId,
+      message_type: 'direct',
+      is_mine: true,
+      is_broadcast: false,
+      timestamp: Date.now(),
+      read_status: 1,
+      delivery_status: 'queued'
+    };
+    await databaseService.saveMessage(dbMessage);
+    return {
+      id: dbMessage.id,
+      text: text,
+      senderId: this.myDeviceId,
+      senderName: this.myDeviceName,
+      receiverId: receiverId,
+      timestamp: Date.now(),
+      isMine: true,
+      isBroadcast: false,
+      type: 'text',
+      read: true,
+      deliveryStatus: 'queued'
+    };
+  }
+
+  startHealthCheck() {
+    if (this.healthTimer) return;
+    this.healthTimer = setInterval(() => {
+      this.ensureHealth();
+    }, 30000);
+  }
+
+  stopHealthCheck() {
+    if (this.healthTimer) {
+      clearInterval(this.healthTimer);
+      this.healthTimer = null;
+    }
+  }
+
+  async ensureHealth() {
+    try {
+      if (this.isRestarting) return;
+      if (!this.isInitialized || !this.lastApiKey) return;
+      const id = await this.getMyDeviceId();
+      if (!id || id === 'initializing...') {
+        this.isRestarting = true;
+        this.emitEvent('onReconnecting', { reason: 'health-check' });
+        await Bridgefy.stop();
+        this.isInitialized = false;
+        await this.initialize(this.lastApiKey);
+        this.startAnnounceLoop();
+        this.sendAnnounce('online', 0);
+        this.flushQueuedMessages();
+        this.isRestarting = false;
+        this.emitEvent('onReconnected', {});
+      }
+    } catch (error) {
+      this.isRestarting = false;
+    }
+  }
+
+  async sendDirectRaw(receiverId, text) {
+    const response = await Bridgefy.sendMessage(receiverId, text);
+      if (response?.id) {
+        this.pendingSendMap.set(response.id, receiverId);
+      }
+    return response;
+  }
+
+  async sendMeshRaw(receiverId, text) {
+    if (!Bridgefy.sendMeshMessage) {
+      throw new Error('Mesh send not available');
+    }
+    const response = await Bridgefy.sendMeshMessage(receiverId, text);
+        if (response?.id) {
+          this.pendingSendMap.set(response.id, receiverId);
+        }
+    return response;
+  }
+
+  async flushQueuedMessages(receiverId = null) {
+    const queued = await databaseService.getQueuedMessages(receiverId);
+    for (const msg of queued) {
+      try {
+        if (this.isInCooldown(msg.receiverId)) {
+          continue;
+        }
+        if (!this.isDirectDevice(msg.receiverId)) {
+          await this.sendMeshRaw(msg.receiverId, msg.text);
+        } else {
+          await this.sendDirectRaw(msg.receiverId, msg.text);
+        }
+        await databaseService.updateMessageStatus(msg.id, 'sent');
+      } catch (error) {
+        this.applySendFailure(msg.receiverId);
+      }
+    }
+  }
   showNotification(message) {
     console.log(
       `ðŸ”” NEW ${message.isBroadcast ? 'BROADCAST' : 'MESSAGE'} from ${message.senderName}: ${message.text.substring(0, 50)}...`
@@ -226,10 +484,21 @@ class BridgefyService {
     // Pause background work when not active; refresh unread counts on resume.
     if (nextState === 'active') {
       this.emitEvent('onUnreadUpdated', this.getUnreadCounts());
+      if (this.isInitialized) {
+        this.startAnnounceLoop();
+        this.sendAnnounce('online', 0);
+        this.flushQueuedMessages();
+        this.startHealthCheck();
+      }
       return;
     }
 
     if (nextState === 'background' || nextState === 'inactive') {
+      if (this.isInitialized) {
+        this.sendAnnounce('offline', 0);
+        this.stopAnnounceLoop();
+        this.stopHealthCheck();
+      }
       if (this.currentChatId !== null) {
         this.currentChatId = null;
       }
@@ -244,6 +513,7 @@ class BridgefyService {
       if (this.isInitialized || this.isInitializing) {
         return true;
       }
+      this.lastApiKey = apiKey;
       this.isInitializing = true;
       await Bridgefy.initialize(apiKey);
       return true;
@@ -258,7 +528,13 @@ class BridgefyService {
   async sendMessage(receiverId, text) {
     try {
       console.log(`📤 Sending to ${receiverId}: ${text}`);
+      if (this.isInCooldown(receiverId)) {
+        return this.queueOutgoingMessage(receiverId, text);
+      }
       const response = await Bridgefy.sendMessage(receiverId, text);
+      if (response?.id) {
+        this.pendingSendMap.set(response.id, receiverId);
+      }
       
       // Create database message
       const dbMessage = {
@@ -292,11 +568,55 @@ class BridgefyService {
         read: true
       };
     } catch (error) {
-      console.error('❌ Send message failed:', error);
-      throw error;
+      console.error('Send message failed:', error);
+      return this.queueOutgoingMessage(receiverId, text);
     }
   }
+  async sendMeshMessage(receiverId, text) {
+    try {
+      console.log(`Sending mesh to ${receiverId}: ${text}`);
+      if (this.isInCooldown(receiverId)) {
+        return this.queueOutgoingMessage(receiverId, text);
+      }
+      if (Bridgefy.sendMeshMessage) {
+        const response = await Bridgefy.sendMeshMessage(receiverId, text);
+        if (response?.id) {
+          this.pendingSendMap.set(response.id, receiverId);
+        }
+        const dbMessage = {
+          id: response.id || `sent_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+          content: text,
+          sender_id: this.myDeviceId,
+          sender_name: this.myDeviceName,
+          receiver_id: receiverId,
+          message_type: 'direct',
+          is_mine: true,
+          is_broadcast: false,
+          timestamp: Date.now(),
+          read_status: 1,
+          delivery_status: 'sent'
+        };
 
+        await databaseService.saveMessage(dbMessage);
+        return {
+          id: dbMessage.id,
+          text: text,
+          senderId: this.myDeviceId,
+          senderName: this.myDeviceName,
+          receiverId: receiverId,
+          timestamp: Date.now(),
+          isMine: true,
+          isBroadcast: false,
+          type: 'text',
+          read: true
+        };
+      }
+      return this.queueOutgoingMessage(receiverId, text);
+    } catch (error) {
+      console.error('Mesh send failed:', error);
+      return this.queueOutgoingMessage(receiverId, text);
+    }
+  }
   async sendBroadcast(text) {
     try {
       console.log(`📢 Broadcasting: ${text}`);
@@ -370,7 +690,25 @@ class BridgefyService {
       }
     }
   }
-
+  async getReachableUsers() {
+    try {
+      const minLastSeen = Date.now() - ANNOUNCE_TTL_MS;
+      const users = await databaseService.getKnownUsers(minLastSeen);
+      const directIds = new Set(this.connectedDevices.keys());
+      return users
+        .filter(u => u.id !== this.myDeviceId && !directIds.has(u.id))
+        .map(u => ({
+          id: u.id,
+          name: u.name,
+          hops: u.hops,
+          lastSeen: u.last_seen,
+          viaPeer: u.via_peer
+        }));
+    } catch (error) {
+      console.error('Error getting reachable users:', error);
+      return [];
+    }
+  }
   async getConversations() {
     try {
       const dbConversations = await databaseService.getConversations();
@@ -494,6 +832,10 @@ class BridgefyService {
     this.currentChatId = deviceId;
   }
 
+  isDirectDevice(deviceId) {
+    return this.connectedDevices.has(deviceId);
+  }
+
   async getMyDeviceId() {
     try {
       const id = await Bridgefy.getMyDeviceId();
@@ -543,6 +885,14 @@ class BridgefyService {
     this.onUnreadUpdatedHandler = callback;
   }
 
+  setOnReconnectingHandler(callback) {
+    this.onReconnectingHandler = callback;
+  }
+
+  setOnReconnectedHandler(callback) {
+    this.onReconnectedHandler = callback;
+  }
+
   emitEvent(eventName, data) {
     if (this[`${eventName}Handler`]) {
       this[`${eventName}Handler`](data);
@@ -551,6 +901,7 @@ class BridgefyService {
 
   async stop() {
     try {
+      this.stopHealthCheck();
       await Bridgefy.stop();
       await databaseService.close();
       this.isInitialized = false;
@@ -564,5 +915,3 @@ class BridgefyService {
 
 // Export singleton instance
 export default new BridgefyService();
-
-

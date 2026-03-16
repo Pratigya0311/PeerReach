@@ -117,12 +117,31 @@ class DatabaseService {
           FOREIGN KEY (device_id) REFERENCES devices(id)
         );
       `);
+      // 4. Known users table (multi-hop discovery)
+      await this.db.executeSql(`
+        CREATE TABLE IF NOT EXISTS known_users (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          last_seen INTEGER NOT NULL,
+          hops INTEGER DEFAULT 0,
+          via_peer TEXT,
+          is_online INTEGER DEFAULT 1,
+          created_at INTEGER DEFAULT (strftime('%s', 'now')),
+          updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+        );
+      `);
+      try {
+        await this.db.executeSql('ALTER TABLE known_users ADD COLUMN is_online INTEGER DEFAULT 1;');
+      } catch (error) {
+        // Column may already exist.
+      }
       // 4. Create indexes for performance
       await this.db.executeSql('CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp DESC);');
       await this.db.executeSql('CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id);');
       await this.db.executeSql('CREATE INDEX IF NOT EXISTS idx_messages_receiver ON messages(receiver_id);');
       await this.db.executeSql('CREATE INDEX IF NOT EXISTS idx_messages_type ON messages(message_type);');
       await this.db.executeSql('CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at DESC);');
+      await this.db.executeSql('CREATE INDEX IF NOT EXISTS idx_known_users_seen ON known_users(last_seen DESC);');
 
       console.log('✅ Database tables created');
 
@@ -437,6 +456,117 @@ class DatabaseService {
       return true;
     } catch (error) {
       console.error('❌ Error updating conversation:', error);
+      throw error;
+    }
+  }
+
+  async updateMessageStatus(messageId, status) {
+    try {
+      await this.ensureInitialized();
+      await this.db.executeSql(
+        `UPDATE messages SET delivery_status = ? WHERE id = ?;`,
+        [status, messageId]
+      );
+      return true;
+    } catch (error) {
+      console.error('Error updating message status:', error);
+      throw error;
+    }
+  }
+
+  async getQueuedMessages(receiverId = null) {
+    try {
+      await this.ensureInitialized();
+      let query = `SELECT * FROM messages WHERE delivery_status = 'queued'`;
+      const params = [];
+      if (receiverId) {
+        query += ` AND receiver_id = ?`;
+        params.push(receiverId);
+      }
+      query += ` ORDER BY timestamp ASC;`;
+      const [results] = await this.db.executeSql(query, params);
+      const messages = [];
+      for (let i = 0; i < results.rows.length; i++) {
+        messages.push(this.normalizeMessage(results.rows.item(i)));
+      }
+      return messages;
+    } catch (error) {
+      console.error('Error getting queued messages:', error);
+      throw error;
+    }
+  }
+
+  // ============ KNOWN USERS (MULTI-HOP) ============
+
+  async upsertKnownUser(user) {
+    try {
+      await this.ensureInitialized();
+      const {
+        id,
+        name,
+        last_seen = Date.now(),
+        hops = 0,
+        via_peer = null,
+        is_online = 1
+      } = user;
+
+      await this.db.executeSql(
+        `INSERT OR REPLACE INTO known_users 
+         (id, name, last_seen, hops, via_peer, is_online, updated_at) 
+         VALUES (?, ?, ?, ?, ?, ?, strftime('%s', 'now'));`,
+        [id, name, last_seen, hops, via_peer, is_online]
+      );
+
+      return true;
+    } catch (error) {
+      console.error('Error upserting known user:', error);
+      throw error;
+    }
+  }
+
+  async getKnownUsers(minLastSeen = 0, includeOffline = false) {
+    try {
+      await this.ensureInitialized();
+      const query = includeOffline
+        ? `SELECT * FROM known_users WHERE last_seen >= ? ORDER BY last_seen DESC;`
+        : `SELECT * FROM known_users WHERE last_seen >= ? AND is_online = 1 ORDER BY last_seen DESC;`;
+      const [results] = await this.db.executeSql(query, [minLastSeen]);
+
+      const users = [];
+      for (let i = 0; i < results.rows.length; i++) {
+        users.push(results.rows.item(i));
+      }
+      return users;
+    } catch (error) {
+      console.error('Error getting known users:', error);
+      throw error;
+    }
+  }
+
+  async pruneKnownUsers(expireBefore) {
+    try {
+      await this.ensureInitialized();
+      await this.db.executeSql(
+        `DELETE FROM known_users WHERE last_seen < ?;`,
+        [expireBefore]
+      );
+      return true;
+    } catch (error) {
+      console.error('Error pruning known users:', error);
+      throw error;
+    }
+  }
+
+  async markKnownUsersStaleByViaPeer(viaPeerId) {
+    try {
+      await this.ensureInitialized();
+      await this.db.executeSql(
+        `UPDATE known_users SET is_online = 0, updated_at = strftime('%s', 'now') WHERE via_peer = ?;`,
+        [viaPeerId]
+      );
+      return true;
+    } catch (error) {
+      console.error('Error marking known users stale:', error);
       throw error;
     }
   }

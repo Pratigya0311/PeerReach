@@ -14,6 +14,7 @@ import BridgefyService from '../services/BridgefyService';
 
 const DevicesScreen = ({ navigation }) => {
   const [devices, setDevices] = useState([]);
+  const [reachable, setReachable] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [myDeviceId, setMyDeviceId] = useState('');
@@ -34,6 +35,8 @@ const DevicesScreen = ({ navigation }) => {
       const deviceList = await BridgefyService.getConnectedDevices();
       const filteredDevices = deviceList.filter(device => device.id !== myDeviceId);
       setDevices(filteredDevices);
+      const reachableUsers = await BridgefyService.getReachableUsers();
+      setReachable(reachableUsers);
       setIsLoading(false);
     } catch (error) {
       console.error('Error loading devices:', error);
@@ -47,32 +50,50 @@ const DevicesScreen = ({ navigation }) => {
     setRefreshing(false);
   };
 
-  const startChat = (device) => {
+  const startChat = (device, isMesh = false) => {
     navigation.navigate('Chat', {
       deviceId: device.id,
       deviceName: device.name,
-      isBroadcast: false
+      isBroadcast: false,
+      isMesh
     });
   };
 
-  const renderDevice = ({ item }) => (
-    <TouchableOpacity
-      style={styles.deviceCard}
-      onPress={() => startChat(item)}
-    >
-      <View style={styles.deviceIcon}>
-        <Text style={styles.deviceIconText}>📱</Text>
-      </View>
-      <View style={styles.deviceInfo}>
-        <Text style={styles.deviceName}>{item.name}</Text>
-        <Text style={styles.deviceId}>
-          ID: {item.id ? `${item.id.substring(0, 12)}...` : 'Unknown'}
-        </Text>
-      </View>
-      <View style={styles.connectionDot} />
-      <Text style={styles.connectText}>Chat →</Text>
-    </TouchableOpacity>
-  );
+  const combined = [
+    { type: 'section', title: 'Nearby' },
+    ...devices.map(device => ({ type: 'device', data: device, isMesh: false })),
+    { type: 'section', title: 'Reachable (Mesh)' },
+    ...reachable.map(device => ({ type: 'device', data: device, isMesh: true })),
+  ];
+
+  const renderItem = ({ item }) => {
+    if (item.type === 'section') {
+      return <Text style={styles.sectionTitle}>{item.title}</Text>;
+    }
+
+    const device = item.data;
+    const isMesh = item.isMesh;
+
+    return (
+      <TouchableOpacity
+        style={styles.deviceCard}
+        onPress={() => startChat(device, isMesh)}
+      >
+        <View style={styles.deviceIcon}>
+          <Text style={styles.deviceIconText}>{isMesh ? 'M' : 'P'}</Text>
+        </View>
+        <View style={styles.deviceInfo}>
+          <Text style={styles.deviceName}>{device.name}</Text>
+          <Text style={styles.deviceId}>
+            ID: {device.id ? `${device.id.substring(0, 12)}...` : 'Unknown'}
+          </Text>
+          {isMesh && <Text style={styles.deviceId}>Hops: {device.hops}</Text>}
+        </View>
+        <View style={styles.connectionDot} />
+        <Text style={styles.connectText}>{isMesh ? 'Mesh Chat ->' : 'Chat ->'}</Text>
+      </TouchableOpacity>
+    );
+  };
 
   if (isLoading) {
     return (
@@ -90,12 +111,15 @@ const DevicesScreen = ({ navigation }) => {
         <Text style={styles.subtitle}>
           Tap a device to start chatting
         </Text>
+        <TouchableOpacity style={styles.refreshNearbyButton} onPress={loadDevices}>
+          <Text style={styles.refreshNearbyText}>Refresh Nearby</Text>
+        </TouchableOpacity>
       </View>
 
       <FlatList
-        data={devices}
-        renderItem={renderDevice}
-        keyExtractor={(item) => item.id}
+        data={combined}
+        renderItem={renderItem}
+        keyExtractor={(item, index) => item.type === 'section' ? `section-${index}` : item.data.id}
         contentContainerStyle={styles.list}
         refreshControl={
           <RefreshControl
@@ -157,6 +181,13 @@ const styles = StyleSheet.create({
   },
   list: {
     padding: 16,
+  },
+  sectionTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#444',
+    marginBottom: 8,
+    marginTop: 12,
   },
   deviceCard: {
     backgroundColor: 'white',
@@ -241,6 +272,19 @@ const styles = StyleSheet.create({
   refreshButtonText: {
     color: 'white',
     fontSize: 16,
+    fontWeight: '600',
+  },
+  refreshNearbyButton: {
+    marginTop: 12,
+    alignSelf: 'flex-start',
+    backgroundColor: '#FFFFFF',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 6,
+  },
+  refreshNearbyText: {
+    color: '#007AFF',
+    fontSize: 14,
     fontWeight: '600',
   },
 });

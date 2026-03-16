@@ -16,6 +16,7 @@ import BridgefyService from '../services/BridgefyService';
 
 const ChatScreen = ({ route, navigation }) => {
   const { deviceId, deviceName, isBroadcast = false } = route.params;
+  const isMesh = !isBroadcast && !BridgefyService.isDirectDevice(deviceId);
   const [messages, setMessages] = useState([]);
   const [inputText, setInputText] = useState('');
   const [isLoading, setIsLoading] = useState(true);
@@ -128,6 +129,8 @@ const ChatScreen = ({ route, navigation }) => {
       
       if (isBroadcast) {
         sentMessage = await BridgefyService.sendBroadcast(text);
+      } else if (isMesh) {
+        sentMessage = await BridgefyService.sendMeshMessage(deviceId, text);
       } else {
         sentMessage = await BridgefyService.sendMessage(deviceId, text);
       }

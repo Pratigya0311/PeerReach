@@ -39,6 +39,8 @@ const HomeScreen = ({ navigation }) => {
     BridgefyService.setOnReadyHandler(handleBridgefyReady);
     BridgefyService.setOnErrorHandler(handleBridgefyError);
     BridgefyService.setOnUnreadUpdatedHandler(handleUnreadUpdated);
+    BridgefyService.setOnReconnectingHandler(handleReconnecting);
+    BridgefyService.setOnReconnectedHandler(handleReconnected);
 
     requestPermissions().then((granted) => {
       if (granted) {
@@ -66,6 +68,8 @@ const HomeScreen = ({ navigation }) => {
       BridgefyService.setOnReadyHandler(null);
       BridgefyService.setOnErrorHandler(null);
       BridgefyService.setOnUnreadUpdatedHandler(null);
+      BridgefyService.setOnReconnectingHandler(null);
+      BridgefyService.setOnReconnectedHandler(null);
     };
   }, []);
 
@@ -147,10 +151,17 @@ const HomeScreen = ({ navigation }) => {
     try {
       setRefreshing(true);
 
-      await BridgefyService.getConnectedDevices();
+      const deviceList = await BridgefyService.getConnectedDevices();
+      const reachableUsers = await BridgefyService.getReachableUsers();
+      const directIds = new Set(deviceList.map(d => d.id));
+      const reachableIds = new Set(reachableUsers.map(d => d.id));
 
       const convos = await BridgefyService.getConversations();
-      setConversations(convos);
+      const convosWithStatus = convos.map(c => ({
+        ...c,
+        isOnline: c.isBroadcast ? true : (directIds.has(c.id) || reachableIds.has(c.id))
+      }));
+      setConversations(convosWithStatus);
 
       const counts = BridgefyService.getUnreadCounts();
       setUnreadCounts(counts);
@@ -179,6 +190,14 @@ const HomeScreen = ({ navigation }) => {
     console.error('❌ Bridgefy error:', error);
     setBridgefyStatus('error');
     Alert.alert('Bridgefy Error', error.message || 'Unknown error occurred');
+  };
+
+  const handleReconnecting = () => {
+    setBridgefyStatus('reconnecting');
+  };
+
+  const handleReconnected = () => {
+    setBridgefyStatus('ready');
   };
 
   const handleUnreadUpdated = (counts) => {
@@ -234,6 +253,9 @@ const HomeScreen = ({ navigation }) => {
             </Text>
             <Text style={styles.conversationTime}>{timeAgo}</Text>
           </View>
+          {!item.isBroadcast && !item.isOnline && (
+            <Text style={styles.offlineLabel}>Offline</Text>
+          )}
           
           <Text 
             style={[
@@ -297,7 +319,9 @@ const HomeScreen = ({ navigation }) => {
         </Text>
         
         <Text style={styles.status}>
-          {bridgefyStatus === 'ready' ? '✅ Online' : '⚠️ Offline'}
+          {bridgefyStatus === 'ready' && '✅ Online'}
+          {bridgefyStatus === 'reconnecting' && '🟡 Reconnecting...'}
+          {bridgefyStatus !== 'ready' && bridgefyStatus !== 'reconnecting' && '⚠️ Offline'}
           {conversations.length > 0 && ` • ${conversations.length} conversation${conversations.length !== 1 ? 's' : ''}`}
         </Text>
       </View>
@@ -522,6 +546,11 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: '#666',
     lineHeight: 18,
+  },
+  offlineLabel: {
+    fontSize: 12,
+    color: '#999',
+    marginTop: 2,
   },
   unreadLastMessage: {
     color: '#333',
