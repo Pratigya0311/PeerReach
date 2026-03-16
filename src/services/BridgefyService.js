@@ -208,6 +208,12 @@ class BridgefyService {
       const senderId = rawMessage.senderId || 'unknown';
       const senderName = rawMessage.senderName || this.connectedDevices.get(senderId) || 'Unknown Device';
 
+      // Update stored name with custom display name from payload (overrides hardware name from SDK)
+      if (rawMessage.senderName && rawMessage.senderName !== this.connectedDevices.get(senderId)) {
+        this.connectedDevices.set(senderId, rawMessage.senderName);
+        databaseService.saveDevice({ id: senderId, name: rawMessage.senderName, connection_status: 'online' }).catch(() => {});
+      }
+
       // Detect photo / location content types
       let contentType = 'text';
       let mediaData = null;

@@ -10,6 +10,8 @@ import {
   Platform,
   ActivityIndicator,
   Image,
+  Modal,
+  Dimensions,
   Linking,
   PermissionsAndroid,
   Alert,
@@ -44,6 +46,7 @@ const ChatScreen = ({ route, navigation }) => {
   const [isLoading, setIsLoading]           = useState(true);
   const [isSending, setIsSending]           = useState(false);
   const [replyTo, setReplyTo]               = useState(null);   // { id, text, senderName }
+  const [fullscreenPhoto, setFullscreenPhoto] = useState(null); // base64 string or null
   const [typingUser, setTypingUser]         = useState(null);   // senderName string
   const [showScrollBtn, setShowScrollBtn]   = useState(false);
   const [isDeviceOnline, setIsDeviceOnline] = useState(true);
@@ -292,8 +295,8 @@ const ChatScreen = ({ route, navigation }) => {
     if (isSending) return;
     try {
       const result = await launchImageLibrary({
-        mediaType: 'photo', maxWidth: 350, maxHeight: 350,
-        quality: 0.4, includeBase64: true,
+        mediaType: 'photo', maxWidth: 600, maxHeight: 600,
+        quality: 0.5, includeBase64: true,
       });
       if (result.didCancel || !result.assets?.[0]) return;
       const { base64, width = 1, height = 1 } = result.assets[0];
@@ -435,16 +438,20 @@ const ChatScreen = ({ route, navigation }) => {
     const isMyMessage = item.isMine;
 
     if (item.contentType === 'photo' && item.mediaData?.data) {
-      const { data, width = 1, height = 1 } = item.mediaData;
-      const aspect        = height / width;
-      const displayWidth  = 220;
-      const displayHeight = Math.round(displayWidth * aspect);
+      const { data } = item.mediaData;
       return (
-        <Image
-          source={{ uri: `data:image/jpeg;base64,${data}` }}
-          style={[styles.photoImage, { width: displayWidth, height: Math.min(displayHeight, 300) }]}
-          resizeMode="cover"
-        />
+        <TouchableOpacity onPress={() => setFullscreenPhoto(data)} activeOpacity={0.85}>
+          <Image
+            source={{ uri: `data:image/jpeg;base64,${data}` }}
+            style={styles.photoThumbnail}
+            resizeMode="cover"
+            resizeMethod="resize"
+            onError={() => {}}
+          />
+          <View style={styles.photoTapHint}>
+            <Text style={styles.photoTapHintText}>Tap to expand</Text>
+          </View>
+        </TouchableOpacity>
       );
     }
 
@@ -580,12 +587,39 @@ const ChatScreen = ({ route, navigation }) => {
   }
 
   // ─── Main render ──────────────────────────────────────────────────────────
+  const screenW = Dimensions.get('window').width;
+  const screenH = Dimensions.get('window').height;
+
   return (
     <KeyboardAvoidingView
       style={styles.container}
       behavior="padding"
       keyboardVerticalOffset={headerHeight}
     >
+      {/* Fullscreen photo viewer */}
+      <Modal
+        visible={!!fullscreenPhoto}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setFullscreenPhoto(null)}
+      >
+        <TouchableOpacity
+          style={styles.fullscreenOverlay}
+          activeOpacity={1}
+          onPress={() => setFullscreenPhoto(null)}
+        >
+          {fullscreenPhoto && (
+            <Image
+              source={{ uri: `data:image/jpeg;base64,${fullscreenPhoto}` }}
+              style={{ width: screenW, height: screenH }}
+              resizeMode="contain"
+              resizeMethod="resize"
+            />
+          )}
+          <Text style={styles.fullscreenClose}>✕  Tap anywhere to close</Text>
+        </TouchableOpacity>
+      </Modal>
+
       <SafeAreaView style={styles.safeArea} edges={['top']}>
         {/* Offline banner — only for direct chats when peer is not reachable */}
         {!isBroadcast && !isDeviceOnline && (
@@ -755,7 +789,18 @@ const makeStyles = (colors) => StyleSheet.create({
     shadowOpacity: 0.1, shadowRadius: 2, elevation: 2,
   },
   broadcastBubble: { backgroundColor: colors.broadcastBubble, borderWidth: 1, borderColor: colors.broadcastBubbleBorder },
-  photoBubble:     { paddingHorizontal: 4, paddingVertical: 4 },
+  photoBubble:      { paddingHorizontal: 4, paddingVertical: 4 },
+  photoThumbnail:   { width: 180, height: 180, borderRadius: 10 },
+  photoTapHint:     { alignItems: 'center', marginTop: 3 },
+  photoTapHintText: { fontSize: 10, color: 'rgba(255,255,255,0.6)' },
+  fullscreenOverlay: {
+    flex: 1, backgroundColor: 'rgba(0,0,0,0.95)',
+    justifyContent: 'center', alignItems: 'center',
+  },
+  fullscreenClose: {
+    position: 'absolute', bottom: 40,
+    color: 'rgba(255,255,255,0.7)', fontSize: 13,
+  },
 
   messageText:      { fontSize: 16, lineHeight: 20 },
   myMessageText:    { color: colors.myBubbleText },

@@ -16,7 +16,24 @@
       "Bash(taskkill /PID 32196 /F)",
       "Bash(taskkill /PID 32196 /F /T)",
       "Bash(curl -s http://localhost:8081/status)",
-      "Bash(curl -s \"http://localhost:8081/index.bundle?platform=android&dev=true&minify=false\")"
+      "Bash(curl -s \"http://localhost:8081/index.bundle?platform=android&dev=true&minify=false\")",
+      "Bash(./gradlew assembleDebug)",
+      "Bash(curl -s \"https://api.duckduckgo.com/?q=capital+of+france&format=json&no_html=1&skip_disambig=1\")",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(''''Type:'''', d.get\\(''''Type''''\\)\\); print\\(''''Answer:'''', d.get\\(''''Answer''''\\)\\); print\\(''''Abstract:'''', d.get\\(''''AbstractText'''',''''''''\\)[:100]\\)\")",
+      "Bash(curl -s \"https://api.duckduckgo.com/?q=capital+of+france&format=json&no_html=1&skip_disambig=1\" -o C:/tmp/ddg.json)",
+      "Bash(node -e \"const d=require\\(''C:/tmp/ddg.json''\\); console.log\\(''Type:'', d.Type\\); console.log\\(''Answer:'', d.Answer\\); console.log\\(''Abstract:'', \\(d.AbstractText||''''\\).substring\\(0,100\\)\\);\")",
+      "Bash(adb -s ZD222WDH6R reverse tcp:8081 tcp:8081)",
+      "Bash(adb -s ZD222WDH6R shell \"am force-stop com.peerreach\")",
+      "Bash(adb -s ZD222WDH6R shell \"am start -n com.peerreach/.MainActivity\")",
+      "Bash(adb -s ZD222WDH6R logcat -d)",
+      "Bash(adb -s fee51cbf071d install -r \"/c/Users/Sadhana/Projects/BridgifyApp/PeerReach/android/app/build/outputs/apk/debug/PeerReach-v1.apk\")",
+      "Bash(adb -s fee51cbf071d reverse tcp:8081 tcp:8081)",
+      "Bash(adb -s fee51cbf071d shell \"am start -n com.peerreach/.MainActivity\")",
+      "Bash(adb -s ZD222WDH6R install -r \"/c/Users/Sadhana/Projects/BridgifyApp/PeerReach/android/app/build/outputs/apk/debug/PeerReach-v1.apk\")"
+    ],
+    "additionalDirectories": [
+      "\\tmp",
+      "C:\\Users\\Sadhana\\AppData\\Local\\Temp"
     ]
   }
 }

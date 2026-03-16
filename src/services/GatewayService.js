@@ -102,15 +102,103 @@ class GatewayService {
 
   // ── Individual API fetchers ─────────────────────────────────────────────────
 
+  _makeSignal(ms) {
+    const c = new AbortController();
+    setTimeout(() => c.abort(), ms);
+    return c.signal;
+  }
+
+  // Standard browser-like headers to avoid WAF/bot challenges
+  get _headers() {
+    return {
+      'User-Agent': 'Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+      'Accept': 'application/json',
+    };
+  }
+
+  _toKeywords(query) {
+    // Strip question prefixes and filler words to get the core topic noun phrase.
+    // "how to survive in mountains" → "survive mountains"
+    // "what is the capital of france" → "capital france"
+    return query
+      .replace(/^(how (do|does|to|can|should|would)|what (is|are|was|were|does)|who (is|was|are)|where (is|are)|when (did|is|was)|why (does|is|did)|explain|define|tell me about)\s+/i, '')
+      .replace(/\b(the|a|an|in|on|at|of|for|to|from|with|by|about|and|or|do|does|did|is|are|was|were|be|being|been|i|you|we|they|he|she|it|its|my|your)\b/gi, ' ')
+      .replace(/\s+/g, ' ').trim();
+  }
+
+  async _wikiSummary(title) {
+    // Fetch plain-text summary for a given Wikipedia article title.
+    const slug = encodeURIComponent(title.replace(/ /g, '_'));
+    const res = await fetch(`https://en.wikipedia.org/api/rest_v1/page/summary/${slug}`, {
+      signal: this._makeSignal(10000),
+      headers: this._headers,
+    });
+    const text = await res.text();
+    const json = JSON.parse(text);
+    const extract = json?.extract?.trim();
+    if (!extract || extract.length < 20) throw new Error('extract too short');
+    return extract.length > 600 ? extract.substring(0, 597) + '...' : extract;
+  }
+
+  async _wikiOpenSearch(query) {
+    // Returns the best matching article title via Wikipedia OpenSearch.
+    const res = await fetch(
+      `https://en.wikipedia.org/w/api.php?action=opensearch&search=${encodeURIComponent(query)}&limit=1&namespace=0&format=json`,
+      { signal: this._makeSignal(10000), headers: this._headers }
+    );
+    const json = JSON.parse(await res.text());
+    const titles = json[1];
+    if (!titles || titles.length === 0) return null;
+    return titles[0];
+  }
+
+  async _wikiFullTextSearch(query) {
+    // Full-text search — finds articles that MENTION the query, not just title matches.
+    const res = await fetch(
+      `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&srlimit=1&format=json`,
+      { signal: this._makeSignal(10000), headers: this._headers }
+    );
+    const json = JSON.parse(await res.text());
+    const hits = json?.query?.search;
+    if (!hits || hits.length === 0) return null;
+    return hits[0].title;
+  }
+
+  async _fetchWikipedia(query) {
+    try {
+      // Strategy 1: opensearch with full query
+      let title = await this._wikiOpenSearch(query);
+
+      // Strategy 2: opensearch with keywords stripped (handles "how to...", "what is...")
+      if (!title) {
+        const keywords = this._toKeywords(query);
+        if (keywords && keywords !== query) title = await this._wikiOpenSearch(keywords);
+      }
+
+      // Strategy 3: full-text search finds articles that mention the topic
+      if (!title) title = await this._wikiFullTextSearch(query);
+
+      if (!title) throw new Error('No Wikipedia article found');
+
+      const extract = await this._wikiSummary(title);
+      console.log('📖 Wikipedia answer from:', title);
+      return extract;
+    } catch (e) {
+      console.log('❌ Wikipedia failed:', e.message);
+      throw e;
+    }
+  }
+
   async _fetchDuckDuckGo(query) {
+    // DDG instant answers for very simple factual queries (calculator, conversions, etc.)
     const url =
       `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 6000);
     try {
-      const res = await fetch(url, { signal: controller.signal });
+      const res = await fetch(url, {
+        signal: this._makeSignal(10000),
+        headers: this._headers,
+      });
       const json = await res.json();
-
       let result = null;
       if (json.Type !== 'D') {
         result = json.Answer || json.AbstractText || json.Definition || null;
@@ -123,38 +211,9 @@ class GatewayService {
       }
       if (!result) throw new Error('No DDG result');
       return result;
-    } finally {
-      clearTimeout(timeout);
-    }
-  }
-
-  async _fetchWikipedia(query) {
-    // Wikipedia OpenSearch API — returns a short extract for the best matching article.
-    // Using w/api.php with exsentences=3 keeps the response short and BLE-friendly.
-    const searchUrl =
-      `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&format=json&utf8=1&srlimit=1&origin=*`;
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 6000);
-    try {
-      const searchRes = await fetch(searchUrl, { signal: controller.signal });
-      const searchJson = await searchRes.json();
-      const hits = searchJson?.query?.search;
-      if (!hits || hits.length === 0) throw new Error('No Wikipedia result');
-
-      const title = hits[0].title;
-      const extractUrl =
-        `https://en.wikipedia.org/w/api.php?action=query&prop=extracts&exsentences=3&exintro=1&explaintext=1&titles=${encodeURIComponent(title)}&format=json&utf8=1&origin=*`;
-      const extractRes = await fetch(extractUrl, { signal: controller.signal });
-      const extractJson = await extractRes.json();
-      const pages = extractJson?.query?.pages;
-      if (!pages) throw new Error('No Wikipedia extract');
-
-      const page = Object.values(pages)[0];
-      const extract = page?.extract?.trim();
-      if (!extract || extract.length < 20) throw new Error('Wikipedia extract too short');
-      return extract;
-    } finally {
-      clearTimeout(timeout);
+    } catch (e) {
+      console.log('❌ DDG failed:', e.message);
+      throw e;
     }
   }
 
@@ -166,16 +225,18 @@ class GatewayService {
       location && location !== 'auto'
         ? `https://wttr.in/${encodeURIComponent(location)}?format=3`
         : 'https://wttr.in/?format=3';
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 6000);
     try {
-      const res = await fetch(weatherUrl, { signal: controller.signal });
+      const res = await fetch(weatherUrl, {
+        signal: this._makeSignal(10000),
+        headers: this._headers,
+      });
       if (!res.ok) throw new Error('wttr.in failed');
       const text = (await res.text()).trim();
       if (!text || text.includes('Unknown location')) throw new Error('Unknown location');
       return text;
-    } finally {
-      clearTimeout(timeout);
+    } catch (e) {
+      console.log('❌ Weather failed:', e.message);
+      throw e;
     }
   }
 

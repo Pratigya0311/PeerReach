@@ -48,6 +48,9 @@ const HomeScreen = ({ navigation }) => {
   useFocusEffect(
     useCallback(() => {
       loadData().catch(console.error);
+      // Refresh display name in case user changed it in Settings
+      const name = BridgefyService.getDisplayName();
+      if (name) setMyDeviceName(name);
     }, [])
   );
 

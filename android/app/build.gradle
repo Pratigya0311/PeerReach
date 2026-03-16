@@ -160,6 +160,7 @@ dependencies {
     implementation 'androidx.work:work-runtime-ktx:2.10.0'
     implementation 'org.signal:libsignal-android:0.65.3'
     implementation 'androidx.security:security-crypto:1.1.0-alpha06'
+    implementation 'androidx.preference:preference:1.2.1'
     // implementation 'me.bridgefy:android-sdk:1.2.3'
     implementation project(':react-native-sqlite-storage')
 }
