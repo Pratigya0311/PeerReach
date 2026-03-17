@@ -123,7 +123,7 @@ const HomeScreen = ({ navigation }) => {
     try {
       setBridgefyStatus('initializing');
       console.log('🚀 Initializing Bridgefy...');
-      const API_KEY = '8a349463-829d-4c67-a489-4a4c5cb82eba';
+      const API_KEY = process.env.GROQ_API_KEY;
       if (!API_KEY || API_KEY.length < 36) {
         Alert.alert('Invalid API Key', 'Please check your Bridgefy API key configuration.');
         setIsLoading(false);
