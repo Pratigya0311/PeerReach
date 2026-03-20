@@ -1,5 +1,5 @@
 // src/screens/MeshQueryScreen.js
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   View,
   Text,
@@ -8,13 +8,12 @@ import {
   ScrollView,
   StyleSheet,
   ActivityIndicator,
-  KeyboardAvoidingView,
-  Platform,
+  Keyboard,
   Alert,
 } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
-import { useHeaderHeight } from '@react-navigation/elements';
 import gatewayService from '../services/GatewayService';
+import BridgefyService from '../services/BridgefyService';
 import { useTheme } from '../theme';
 
 const STATUS = {
@@ -30,21 +29,31 @@ const MeshQueryScreen = ({ navigation }) => {
   const colors = useTheme();
   const styles = useMemo(() => makeStyles(colors), [colors]);
   const insets = useSafeAreaInsets();
-  const headerHeight = useHeaderHeight();
-
   const [query, setQuery]             = useState('');
   const [status, setStatus]           = useState(STATUS.IDLE);
   const [results, setResults]         = useState([]);
   const [isGateway, setIsGateway]     = useState(false);
+  const [peerCount, setPeerCount]     = useState(() => BridgefyService.connectedDevices?.size ?? 0);
   const [pendingCount, setPendingCount] = useState(0);
-  const inputRef = useRef(null);
+  const [keyboardHeight, setKeyboardHeight] = useState(0);
+
+  useEffect(() => {
+    const show = Keyboard.addListener('keyboardDidShow', e => setKeyboardHeight(e.endCoordinates.height));
+    const hide = Keyboard.addListener('keyboardDidHide', () => setKeyboardHeight(0));
+    return () => { show.remove(); hide.remove(); };
+  }, []);
 
   useEffect(() => {
     navigation.setOptions({ title: 'Ask the Mesh' });
 
-    gatewayService.checkInternet()
-      .then(setIsGateway)
-      .catch(err => { console.error('Failed to check internet:', err); setIsGateway(false); });
+    const refreshStatus = () => {
+      setPeerCount(BridgefyService.connectedDevices?.size ?? 0);
+      gatewayService.checkInternet()
+        .then(setIsGateway)
+        .catch(() => setIsGateway(false));
+    };
+    refreshStatus();
+    const statusInterval = setInterval(refreshStatus, 10000);
 
     gatewayService.getCacheHistory()
       .then(history => {
@@ -57,10 +66,10 @@ const MeshQueryScreen = ({ navigation }) => {
 
     gatewayService.setOnQueryResultCallback(({ result, query: q, delayed }) => {
       if (delayed) {
-        setResults(prev => [
-          { query: q, result, source: 'mesh (delayed)', timestamp: Date.now() },
-          ...prev,
-        ]);
+        setResults(prev => {
+          const next = [{ query: q, result, source: 'mesh (delayed)', timestamp: Date.now() }, ...prev];
+          return next.length > 50 ? next.slice(0, 50) : next;
+        });
         setPendingCount(gatewayService.getPendingQueueCount());
         Alert.alert(
           'Delayed Response',
@@ -70,7 +79,10 @@ const MeshQueryScreen = ({ navigation }) => {
       }
     });
 
-    return () => { gatewayService.setOnQueryResultCallback(null); };
+    return () => {
+      clearInterval(statusInterval);
+      gatewayService.setOnQueryResultCallback(null);
+    };
   }, [navigation]);
 
   const handleSend = async () => {
@@ -81,34 +93,49 @@ const MeshQueryScreen = ({ navigation }) => {
     try {
       const { result, source } = await gatewayService.sendQuery(q, (hasInternet) => {
         setIsGateway(hasInternet);
+        setPeerCount(BridgefyService.connectedDevices?.size ?? 0);
         setStatus(hasInternet ? STATUS.SEARCHING : STATUS.WAITING_MESH);
       });
-      setResults(prev => [{ query: q, result, source, timestamp: Date.now() }, ...prev]);
+      setResults(prev => {
+        const next = [{ query: q, result, source, timestamp: Date.now() }, ...prev];
+        return next.length > 50 ? next.slice(0, 50) : next; // cap list at 50 items
+      });
       setQuery('');
       setStatus(STATUS.DONE);
     } catch (err) {
       if (err.message === 'NO_GATEWAY_NEARBY') {
         setPendingCount(gatewayService.getPendingQueueCount());
-        setResults(prev => [{
-          query: q,
-          result: 'No gateway found nearby. Your request has been queued and will be answered automatically when a device with internet comes into range.',
-          source: 'queued',
-          timestamp: Date.now(),
-        }, ...prev]);
+        setResults(prev => {
+          const next = [{
+            query: q,
+            result: 'No gateway found nearby. Your request has been queued and will be answered automatically when a device with internet comes into range.',
+            source: 'queued',
+            timestamp: Date.now(),
+          }, ...prev];
+          return next.length > 50 ? next.slice(0, 50) : next;
+        });
         setQuery('');
         setStatus(STATUS.DONE);
       } else {
+        // Reset to IDLE when user dismisses so they can retry immediately
+        Alert.alert('Error', err.message || 'Query failed', [
+          { text: 'OK', onPress: () => setStatus(STATUS.IDLE) },
+        ]);
         setStatus(STATUS.ERROR);
-        Alert.alert('Error', err.message || 'Query failed');
       }
     }
   };
+
+  // gateway = has internet, relay = no internet but has peers, offline = neither
+  const gatewayMode = isGateway ? 'gateway' : peerCount > 0 ? 'relay' : 'offline';
 
   const getStatusText = () => {
     switch (status) {
       case STATUS.CHECKING:     return 'Checking connectivity...';
       case STATUS.SEARCHING:    return 'Searching the internet...';
-      case STATUS.WAITING_MESH: return 'Broadcasting through mesh... waiting for a gateway...';
+      case STATUS.WAITING_MESH: return peerCount > 0
+        ? `Broadcasting through ${peerCount} mesh peer${peerCount !== 1 ? 's' : ''}... waiting for a gateway...`
+        : 'No mesh peers nearby — your request is queued';
       case STATUS.ERROR:        return 'Something went wrong';
       default:                  return '';
     }
@@ -131,18 +158,18 @@ const MeshQueryScreen = ({ navigation }) => {
     status === STATUS.WAITING_MESH;
 
   return (
-    <KeyboardAvoidingView
-      style={styles.container}
-      behavior="padding"
-      keyboardVerticalOffset={headerHeight}
-    >
+    <View style={[styles.container, { paddingBottom: keyboardHeight }]}>
       <SafeAreaView style={styles.safe} edges={['top']}>
-        {/* Status bar */}
-        <View style={[styles.statusBar, isGateway ? styles.statusBarGateway : styles.statusBarRelay]}>
+        {/* Status bar — 3 states: gateway / relay / offline */}
+        <View style={[styles.statusBar, styles[`statusBar_${gatewayMode}`]]}>
           <View style={styles.statusBarLeft}>
-            <View style={[styles.statusDot, isGateway ? styles.dotGateway : styles.dotRelay]} />
+            <View style={[styles.statusDot, styles[`dot_${gatewayMode}`]]} />
             <Text style={styles.statusBarText}>
-              {isGateway ? 'Gateway — you have internet' : 'Relay — using mesh to reach internet'}
+              {gatewayMode === 'gateway'
+                ? 'Gateway — you have internet'
+                : gatewayMode === 'relay'
+                  ? `Relay — ${peerCount} mesh peer${peerCount !== 1 ? 's' : ''} nearby`
+                  : 'Offline — no internet or nearby peers'}
             </Text>
           </View>
           {pendingCount > 0 && (
@@ -168,9 +195,11 @@ const MeshQueryScreen = ({ navigation }) => {
               <View style={styles.emptyIconCircle} />
               <Text style={styles.emptyTitle}>Ask anything</Text>
               <Text style={styles.emptySubtitle}>
-                {isGateway
+                {gatewayMode === 'gateway'
                   ? 'You have internet — queries run directly.'
-                  : 'No internet? Nearby devices with internet will answer your query through the mesh.'}
+                  : gatewayMode === 'relay'
+                    ? `${peerCount} nearby device${peerCount !== 1 ? 's' : ''} may relay your query to the internet.`
+                    : 'No internet or mesh peers. Queries are queued and answered when a connection is found.'}
               </Text>
               <Text style={styles.exampleLabel}>Example queries:</Text>
               {['capital of france', 'weather bangalore', 'speed of light', 'what is bitcoin'].map(ex => (
@@ -205,7 +234,6 @@ const MeshQueryScreen = ({ navigation }) => {
         {/* Input bar */}
         <View style={[styles.inputBar, { paddingBottom: Math.max(insets.bottom, 8) }]}>
           <TextInput
-            ref={inputRef}
             style={styles.input}
             placeholder="Ask anything..."
             placeholderTextColor={colors.placeholder}
@@ -228,7 +256,7 @@ const MeshQueryScreen = ({ navigation }) => {
           </TouchableOpacity>
         </View>
       </SafeAreaView>
-    </KeyboardAvoidingView>
+    </View>
   );
 };
 
@@ -241,12 +269,14 @@ const makeStyles = (colors) => StyleSheet.create({
     flexDirection: 'row', justifyContent: 'space-between',
     alignItems: 'center', paddingHorizontal: 16, paddingVertical: 8,
   },
-  statusBarGateway: { backgroundColor: colors.statusBarGateway },
-  statusBarRelay:   { backgroundColor: colors.statusBarRelay },
+  statusBar_gateway: { backgroundColor: colors.statusBarGateway },
+  statusBar_relay:   { backgroundColor: colors.statusBarRelay },
+  statusBar_offline: { backgroundColor: colors.statusBarOffline },
   statusBarLeft:    { flexDirection: 'row', alignItems: 'center' },
-  statusDot:        { width: 8, height: 8, borderRadius: 4, marginRight: 8 },
-  dotGateway:       { backgroundColor: colors.success },
-  dotRelay:         { backgroundColor: colors.warning },
+  statusDot:        { width: 8, height: 8, borderRadius: 8, overflow: 'hidden', marginRight: 8 },
+  dot_gateway:      { backgroundColor: colors.success },
+  dot_relay:        { backgroundColor: colors.warning },
+  dot_offline:      { backgroundColor: colors.error },
   statusBarText:    { fontSize: 13, fontWeight: '500', color: colors.statusBarText },
   pendingText:      { fontSize: 12, color: colors.warning, fontWeight: '600' },
 

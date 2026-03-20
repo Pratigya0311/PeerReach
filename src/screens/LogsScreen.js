@@ -6,9 +6,10 @@ import {
   FlatList,
   TouchableOpacity,
   StyleSheet,
-  SafeAreaView,
   Alert,
+  Platform,
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect } from '@react-navigation/native';
 import LogService from '../services/LogService';
 import { useTheme } from '../theme';
@@ -45,7 +46,11 @@ const LogsScreen = () => {
   };
 
   const handleShare = async () => {
-    await LogService.shareLogs();
+    try {
+      await LogService.shareLogs();
+    } catch (e) {
+      Alert.alert('Share failed', e?.message || 'Could not share logs.');
+    }
   };
 
   const handleClear = () => {
@@ -132,7 +137,7 @@ const makeStyles = (colors) => StyleSheet.create({
 
   list: { padding: 10 },
   logLine: {
-    fontFamily: 'monospace',
+    fontFamily: Platform.select({ ios: 'Courier', android: 'monospace', default: 'monospace' }),
     fontSize: 11,
     lineHeight: 16,
     marginBottom: 2,

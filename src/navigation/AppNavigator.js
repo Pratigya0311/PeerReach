@@ -1,5 +1,5 @@
 import React from 'react';
-import { TouchableOpacity, StyleSheet } from 'react-native';
+import { TouchableOpacity, StyleSheet, useColorScheme } from 'react-native';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 import { NavigationContainer, DarkTheme, DefaultTheme } from '@react-navigation/native';
 import { createStackNavigator } from '@react-navigation/stack';
@@ -12,6 +12,7 @@ import MediaGalleryScreen from '../screens/MediaGalleryScreen';
 import LogsScreen from '../screens/LogsScreen';
 import SettingsScreen from '../screens/SettingsScreen';
 import FindDeviceScreen from '../screens/FindDeviceScreen';
+import OnboardingScreen from '../screens/OnboardingScreen';
 
 const Stack = createStackNavigator();
 
@@ -41,13 +42,14 @@ const DarkNavTheme = {
 
 const AppNavigator = () => {
   const { themePref } = useThemeCtx();
-  const isDark    = themePref === 'dark' || (themePref === 'system' && require('react-native').Appearance.getColorScheme() === 'dark');
+  const systemScheme  = useColorScheme();
+  const isDark        = themePref === 'dark' || (themePref === 'system' && systemScheme === 'dark');
   const navTheme  = isDark ? DarkNavTheme : LightNavTheme;
 
   return (
     <NavigationContainer theme={navTheme}>
       <Stack.Navigator
-        initialRouteName="Home"
+        initialRouteName="Onboarding"
         screenOptions={({ navigation }) => ({
           headerTintColor: '#FFFFFF',
           headerTitleStyle: { fontWeight: 'bold', color: '#FFFFFF' },
@@ -67,6 +69,11 @@ const AppNavigator = () => {
           ),
         })}
       >
+        <Stack.Screen
+          name="Onboarding"
+          component={OnboardingScreen}
+          options={{ headerShown: false }}
+        />
         <Stack.Screen
           name="Home"
           component={HomeScreen}

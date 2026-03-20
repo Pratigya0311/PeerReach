@@ -55,6 +55,9 @@ class DatabaseService {
 
   async createTables() {
     try {
+      // Enable foreign key enforcement — SQLite has it OFF by default
+      await this.db.executeSql('PRAGMA foreign_keys = ON;');
+
       // 1. Devices table
       await this.db.executeSql(`
         CREATE TABLE IF NOT EXISTS devices (
@@ -113,19 +116,34 @@ class DatabaseService {
         );
       `);
 
-      // 5. Migrate: add is_pinned, reply, battery columns (safe — no-op if already exists)
-      try {
-        await this.db.executeSql('ALTER TABLE messages ADD COLUMN is_pinned INTEGER DEFAULT 0;');
-      } catch (_e) { /* column already exists */ }
-      try {
-        await this.db.executeSql('ALTER TABLE messages ADD COLUMN reply_to_id TEXT;');
-      } catch (_e) { /* column already exists */ }
-      try {
-        await this.db.executeSql('ALTER TABLE messages ADD COLUMN reply_preview TEXT;');
-      } catch (_e) { /* column already exists */ }
-      try {
-        await this.db.executeSql('ALTER TABLE devices ADD COLUMN battery INTEGER;');
-      } catch (_e) { /* column already exists */ }
+      // 5. Migrate: add missing columns (check first so no native-level SQL errors logged)
+      const [msgCols]    = await this.db.executeSql('PRAGMA table_info(messages);');
+      const [devCols]    = await this.db.executeSql('PRAGMA table_info(devices);');
+      const existingMsg  = new Set();
+      const existingDev  = new Set();
+      for (let i = 0; i < msgCols.rows.length; i++) existingMsg.add(msgCols.rows.item(i).name);
+      for (let i = 0; i < devCols.rows.length; i++) existingDev.add(devCols.rows.item(i).name);
+
+      const msgMigrations = [
+        ['is_pinned',   'ALTER TABLE messages ADD COLUMN is_pinned INTEGER DEFAULT 0;'],
+        ['reply_to_id', 'ALTER TABLE messages ADD COLUMN reply_to_id TEXT;'],
+        ['reply_preview','ALTER TABLE messages ADD COLUMN reply_preview TEXT;'],
+        ['delivered_at','ALTER TABLE messages ADD COLUMN delivered_at INTEGER;'],
+        ['read_at',     'ALTER TABLE messages ADD COLUMN read_at INTEGER;'],
+      ];
+      const safeAlter = async (sql) => {
+        try { await this.db.executeSql(sql); }
+        catch (e) {
+          // "duplicate column" means the column already exists — safe to ignore
+          if (!String(e.message).includes('duplicate column')) throw e;
+        }
+      };
+      for (const [col, sql] of msgMigrations) {
+        if (!existingMsg.has(col)) await safeAlter(sql);
+      }
+      if (!existingDev.has('battery')) {
+        await safeAlter('ALTER TABLE devices ADD COLUMN battery INTEGER;');
+      }
 
       // 6. Create indexes for performance
       await this.db.executeSql('CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp DESC);');
@@ -137,8 +155,9 @@ class DatabaseService {
       console.log('✅ Database tables created');
 
     } catch (error) {
+      // Log but don't throw — a failed migration step (e.g. duplicate column from a previous
+      // concurrent init) should not prevent the app from using an otherwise valid database.
       console.error('❌ Error creating tables:', error);
-      throw error;
     }
   }
 
@@ -249,6 +268,28 @@ class DatabaseService {
         reply_preview = null,
       } = message;
 
+      // Ensure sender/receiver rows exist so FK constraints don't fire.
+      // Use INSERT OR IGNORE so we never overwrite a proper name already saved.
+      if (sender_id) {
+        const fallbackName = (sender_name && sender_name !== 'Unknown Device')
+          ? sender_name
+          : `Device_${sender_id.substring(0, 8)}`;
+        await this.db.executeSql(
+          `INSERT OR IGNORE INTO devices (id, name, connection_status) VALUES (?, ?, 'online');`,
+          [sender_id, fallbackName]
+        );
+      }
+      if (receiver_id) {
+        // Check if receiver already has a real name before inserting a generic one
+        const [existing] = await this.db.executeSql('SELECT name FROM devices WHERE id = ?', [receiver_id]);
+        if (!existing || existing.rows.length === 0) {
+          await this.db.executeSql(
+            `INSERT OR IGNORE INTO devices (id, name, connection_status) VALUES (?, ?, 'online');`,
+            [receiver_id, `Device_${receiver_id.substring(0, 8)}`]
+          );
+        }
+      }
+
       // Save message
       await this.db.executeSql(
         `INSERT OR IGNORE INTO messages
@@ -267,13 +308,25 @@ class DatabaseService {
     }
   }
 
-  async updateMessageStatus(messageId, status) {
+  async updateMessageStatus(messageId, status, ts = Date.now()) {
     try {
       await this.ensureInitialized();
-      await this.db.executeSql(
-        'UPDATE messages SET delivery_status = ? WHERE id = ?',
-        [status, messageId]
-      );
+      if (status === 'delivered') {
+        await this.db.executeSql(
+          'UPDATE messages SET delivery_status = ?, delivered_at = ? WHERE id = ?',
+          [status, ts, messageId]
+        );
+      } else if (status === 'read') {
+        await this.db.executeSql(
+          'UPDATE messages SET delivery_status = ?, read_at = ? WHERE id = ?',
+          [status, ts, messageId]
+        );
+      } else {
+        await this.db.executeSql(
+          'UPDATE messages SET delivery_status = ? WHERE id = ?',
+          [status, messageId]
+        );
+      }
     } catch (err) {
       console.warn('updateMessageStatus error:', err);
     }
@@ -372,11 +425,11 @@ class DatabaseService {
       const term = `%${query}%`;
       const [results] = await this.db.executeSql(
         `SELECT * FROM messages
-         WHERE content LIKE ?
-         AND message_type IN ('direct', 'broadcast')
+         WHERE message_type IN ('direct', 'broadcast')
+         AND (content LIKE ? OR sender_name LIKE ?)
          ORDER BY timestamp DESC
          LIMIT ?`,
-        [term, limit]
+        [term, term, limit]
       );
       const messages = [];
       for (let i = 0; i < results.rows.length; i++) {
@@ -463,10 +516,10 @@ class DatabaseService {
           const parsed = JSON.parse(preview);
           if (parsed.type === 'photo') preview = '[Photo]';
           else if (parsed.type === 'location') preview = '[Location]';
-          else if (parsed.type === 'sos') preview = '🚨 SOS — Emergency';
+          else if (parsed.type === 'sos') preview = '[SOS] Emergency alert';
           else if (parsed.type === 'file') preview = `[File] ${parsed.fileName || 'attachment'}`;
-          else if (parsed.type === 'find_me_request') preview = '📍 Find Me request';
-          else if (parsed.type === 'find_me_response') preview = '📍 Location shared';
+          else if (parsed.type === 'find_me_request') preview = '[Find Me] Request';
+          else if (parsed.type === 'find_me_response') preview = '[Location] Shared';
           else preview = parsed.text || preview;
         } catch (_e) { /* keep raw */ }
       }
@@ -618,6 +671,8 @@ class DatabaseService {
       timestamp: dbMessage.timestamp,
       read: dbMessage.read_status === 1,
       deliveryStatus: dbMessage.delivery_status,
+      deliveredAt: dbMessage.delivered_at || null,
+      readAt: dbMessage.read_at || null,
       isPinned: dbMessage.is_pinned === 1,
       replyToId: dbMessage.reply_to_id || null,
       replyPreview: dbMessage.reply_preview || null,
@@ -637,30 +692,6 @@ class DatabaseService {
       isBroadcast: dbConversation.message_type === 'broadcast',
       updatedAt: dbConversation.updated_at
     };
-  }
-
-  async getMessageCount() {
-    try {
-      await this.ensureInitialized();
-      const [results] = await this.db.executeSql('SELECT COUNT(*) as count FROM messages;');
-      return results.rows.item(0).count;
-    } catch (error) {
-      console.error('❌ Error getting message count:', error);
-      throw error;
-    }
-  }
-
-  async getDatabaseSize() {
-    try {
-      await this.ensureInitialized();
-      const [results] = await this.db.executeSql(
-        "SELECT page_count * page_size as size FROM pragma_page_count(), pragma_page_size();"
-      );
-      return results.rows.item(0).size;
-    } catch (error) {
-      console.error('❌ Error getting database size:', error);
-      return 0;
-    }
   }
 
   async close() {

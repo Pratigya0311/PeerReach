@@ -1,14 +1,13 @@
-import React, { useState, useCallback, useMemo, useEffect } from 'react';
+import React, { useState, useCallback, useMemo } from 'react';
 import {
   View,
   Text,
   FlatList,
   TouchableOpacity,
   StyleSheet,
-  ActivityIndicator,
-  SafeAreaView,
   RefreshControl,
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect } from '@react-navigation/native';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 import BridgefyService from '../services/BridgefyService';
@@ -19,21 +18,18 @@ const DevicesScreen = ({ navigation }) => {
   const styles = useMemo(() => makeStyles(colors), [colors]);
 
   const [devices, setDevices]       = useState([]);
-  const [isLoading, setIsLoading]   = useState(true);
   const [refreshing, setRefreshing] = useState(false);
 
   useFocusEffect(
-    useCallback(() => { loadDevices(); }, [])
+    useCallback(() => {
+      loadDevices();
+      BridgefyService.setOnDeviceListUpdatedHandler(() => loadDevices());
+      return () => BridgefyService.setOnDeviceListUpdatedHandler(null);
+    }, [])
   );
 
-  useEffect(() => {
-    BridgefyService.setOnDeviceListUpdatedHandler(() => loadDevices(true));
-    return () => BridgefyService.setOnDeviceListUpdatedHandler(null);
-  }, []);
-
-  const loadDevices = async (isRefresh = false) => {
+  const loadDevices = async () => {
     try {
-      if (!isRefresh) setIsLoading(true);
       const [deviceList, myId] = await Promise.all([
         BridgefyService.getConnectedDevices(),
         BridgefyService.getMyDeviceId(),
@@ -41,15 +37,13 @@ const DevicesScreen = ({ navigation }) => {
       setDevices(deviceList.filter(d => d.id !== myId));
     } catch (error) {
       console.error('Error loading devices:', error);
-    } finally {
-      if (!isRefresh) setIsLoading(false);
     }
   };
 
   const onRefresh = async () => {
     setRefreshing(true);
     try {
-      await loadDevices(true);
+      await loadDevices();
     } finally {
       setRefreshing(false);
     }
@@ -63,26 +57,11 @@ const DevicesScreen = ({ navigation }) => {
     });
   };
 
-  const formatLastSeen = (ts) => {
-    if (!ts) return null;
-    const diff = Date.now() - ts;
-    const secs = Math.floor(diff / 1000);
-    if (secs < 30)  return 'Just now';
-    if (secs < 60)  return `${secs}s ago`;
-    const mins = Math.floor(secs / 60);
-    if (mins < 60)  return `${mins}m ago`;
-    const hrs = Math.floor(mins / 60);
-    return `${hrs}h ago`;
-  };
-
   const renderDevice = ({ item }) => {
-    const lastSeenLabel = formatLastSeen(item.lastSeen);
     return (
       <TouchableOpacity style={styles.deviceCard} onPress={() => startChat(item)}>
         <View style={styles.deviceIcon}>
-          <Text style={styles.deviceIconText}>
-            {(item.name || '?')[0].toUpperCase()}
-          </Text>
+          <Icon name="smartphone" size={26} color={colors.primary} />
         </View>
 
         <View style={styles.deviceInfo}>
@@ -90,32 +69,16 @@ const DevicesScreen = ({ navigation }) => {
           <Text style={styles.deviceId}>
             ID: {item.id ? `${item.id.substring(0, 12)}...` : 'Unknown'}
           </Text>
-          {lastSeenLabel && (
-            <Text style={styles.deviceLastSeen}>Last seen: {lastSeenLabel}</Text>
+          {item.battery != null && (
+            <Text style={styles.batteryText}>{item.battery}% battery</Text>
           )}
         </View>
 
-        <View style={styles.deviceRight}>
-          {item.battery != null && (
-            <View style={styles.batteryRow}>
-              <Text style={styles.batteryText}>{item.battery}%</Text>
-            </View>
-          )}
-          <View style={styles.connectionDot} />
-          <Text style={styles.connectText}>Chat →</Text>
-        </View>
+        <View style={styles.connectionDot} />
+        <Text style={styles.connectText}>Chat →</Text>
       </TouchableOpacity>
     );
   };
-
-  if (isLoading) {
-    return (
-      <SafeAreaView style={styles.loadingContainer}>
-        <ActivityIndicator size="large" color={colors.primary} />
-        <Text style={styles.loadingText}>Searching for devices...</Text>
-      </SafeAreaView>
-    );
-  }
 
   return (
     <SafeAreaView style={styles.container}>
@@ -139,12 +102,12 @@ const DevicesScreen = ({ navigation }) => {
         }
         ListEmptyComponent={
           <View style={styles.emptyState}>
-            <View style={styles.emptyIconCircle} />
+            <Icon name="search" size={64} color={colors.textMuted} style={styles.emptyIcon} />
             <Text style={styles.emptyText}>No devices found</Text>
             <Text style={styles.emptySubtext}>
               Make sure other devices have PeerReach running nearby
             </Text>
-            <TouchableOpacity style={styles.refreshButton} onPress={loadDevices}>
+            <TouchableOpacity style={styles.refreshButton} onPress={onRefresh}>
               <Text style={styles.refreshButtonText}>Refresh</Text>
             </TouchableOpacity>
           </View>
@@ -156,15 +119,11 @@ const DevicesScreen = ({ navigation }) => {
 
 // ─── Styles (theme-aware) ────────────────────────────────────────────────────
 const makeStyles = (colors) => StyleSheet.create({
-  container:        { flex: 1, backgroundColor: colors.background },
-  loadingContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: colors.background },
-  loadingText:      { fontSize: 16, color: colors.textSecondary, marginTop: 12 },
+  container: { flex: 1, backgroundColor: colors.background },
 
   header: {
     backgroundColor: colors.headerBg,
     padding: 20,
-    paddingTop: 60,
-    paddingBottom: 20,
   },
   title:    { fontSize: 28, fontWeight: 'bold', color: colors.headerText },
   subtitle: { fontSize: 14, color: colors.headerSubtitle, marginTop: 4 },
@@ -181,18 +140,14 @@ const makeStyles = (colors) => StyleSheet.create({
   },
   deviceIcon: {
     width: 50, height: 50, borderRadius: 25,
-    backgroundColor: colors.avatarDirectBg,
+    backgroundColor: colors.primary + '18',
     justifyContent: 'center', alignItems: 'center',
     marginRight: 12,
   },
-  deviceIconText: { fontSize: 18, fontWeight: '700', color: colors.onColor },
   deviceInfo:     { flex: 1 },
   deviceName:     { fontSize: 16, fontWeight: '600', color: colors.text, marginBottom: 4 },
   deviceId:       { fontSize: 12, color: colors.textMuted },
-  deviceRight:    { alignItems: 'flex-end', gap: 4 },
-  batteryRow:     { flexDirection: 'row', alignItems: 'center' },
-  batteryText:    { fontSize: 11, color: colors.textMuted, fontWeight: '600' },
-  deviceLastSeen: { fontSize: 11, color: colors.textMuted, marginTop: 2 },
+  batteryText:    { fontSize: 11, color: colors.textMuted, marginTop: 2 },
   connectionDot:  { width: 10, height: 10, borderRadius: 5, backgroundColor: colors.success, marginRight: 8 },
   connectText:    { color: colors.connectText, fontSize: 14, fontWeight: '600' },
 
@@ -200,7 +155,7 @@ const makeStyles = (colors) => StyleSheet.create({
     flex: 1, justifyContent: 'center', alignItems: 'center',
     padding: 40, marginTop: 60,
   },
-  emptyIconCircle:  { width: 64, height: 64, borderRadius: 32, backgroundColor: colors.emptyCircle, marginBottom: 16 },
+  emptyIcon:        { marginBottom: 16 },
   emptyText:        { fontSize: 18, fontWeight: '600', color: colors.text, marginBottom: 8 },
   emptySubtext:     { fontSize: 14, color: colors.textMuted, textAlign: 'center', marginBottom: 24, lineHeight: 20 },
   refreshButton:    { backgroundColor: colors.primary, paddingHorizontal: 24, paddingVertical: 12, borderRadius: 8 },

@@ -35,6 +35,10 @@ class GatewayService {
     this.onQueryResultCallback = null; // called when a response arrives
     this.retryTimer = null;
 
+    // Internet check cache — avoid hammering the network on every relay packet
+    this._internetCheckResult = false;
+    this._internetCheckTime   = 0;
+
     this._startRetryTimer();
   }
 
@@ -55,9 +59,15 @@ class GatewayService {
   // ── Internet connectivity check ─────────────────────────────────────────────
 
   async checkInternet() {
+    // Return cached result if fresh — prevents hammering the network on every incoming relay packet
+    if (Date.now() - this._internetCheckTime < 10000) {
+      return this._internetCheckResult;
+    }
+
     // Try each URL in order — first 204 response wins.
     // Strictly checking status === 204 prevents captive portal login pages (which return 200) from
     // being mistaken for real internet connectivity.
+    let result = false;
     for (const url of CONNECTIVITY_URLS) {
       try {
         const controller = new AbortController();
@@ -65,7 +75,7 @@ class GatewayService {
         try {
           const res = await fetch(url, { method: 'HEAD', signal: controller.signal });
           console.log('[Gateway] checkInternet →', url, 'status:', res.status);
-          if (res.status === 204) return true;
+          if (res.status === 204) { result = true; break; }
         } finally {
           clearTimeout(timeout);
         }
@@ -73,8 +83,11 @@ class GatewayService {
         // This URL failed — try the next one
       }
     }
-    console.log('[Gateway] checkInternet → no reachable URL, returning false');
-    return false;
+
+    this._internetCheckResult = result;
+    this._internetCheckTime   = Date.now();
+    console.log('[Gateway] checkInternet → cached result:', result);
+    return result;
   }
 
   // ── Query type detection ────────────────────────────────────────────────────
@@ -86,6 +99,7 @@ class GatewayService {
   _extractLocation(query) {
     // Strip weather keywords to get the city/location
     return query
+      .replace(/^(what[''\u2018\u2019]?s|what is|how is|how[''\u2018\u2019]?s|tell me|show me)\s+/i, '')
       .replace(/\b(weather|forecast|temperature|temp|rain|sunny|cloudy|humid|wind|climate|hot|cold|in|at|for|the|of|current|today|tomorrow)\b/gi, '')
       .replace(/[^\w\s]/g, '')
       .trim()
@@ -109,6 +123,11 @@ class GatewayService {
   // ── Individual API fetchers ─────────────────────────────────────────────────
 
   _makeSignal(ms) {
+    // AbortSignal.timeout() is the clean built-in (no timer to leak).
+    // Fall back to the manual approach on older Hermes builds.
+    if (typeof AbortSignal?.timeout === 'function') {
+      return AbortSignal.timeout(ms);
+    }
     const c = new AbortController();
     setTimeout(() => c.abort(), ms);
     return c.signal;
@@ -198,7 +217,7 @@ class GatewayService {
   async _fetchGroq(query) {
     console.log('[Groq] Starting request for query:', query);
 
-    if (!GROQ_API_KEY || GROQ_API_KEY === 'YOUR_GROQ_API_KEY_HERE') {
+    if (!GROQ_API_KEY || GROQ_API_KEY === '') {
       console.error('[Groq] ❌ API key is missing or not configured');
       throw new Error('Groq API key not configured');
     }
@@ -267,34 +286,6 @@ class GatewayService {
     return content.length > 800 ? content.substring(0, 797) + '...' : content;
   }
 
-  async _fetchDuckDuckGo(query) {
-    // DDG instant answers for very simple factual queries (calculator, conversions, etc.)
-    const url =
-      `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
-    try {
-      const res = await fetch(url, {
-        signal: this._makeSignal(10000),
-        headers: this._headers,
-      });
-      const json = await res.json();
-      let result = null;
-      if (json.Type !== 'D') {
-        result = json.Answer || json.AbstractText || json.Definition || null;
-      }
-      if (!result && Array.isArray(json.RelatedTopics)) {
-        const firstTopic = json.RelatedTopics.find(
-          t => t && typeof t.Text === 'string' && t.Text.length > 10
-        );
-        if (firstTopic) result = firstTopic.Text;
-      }
-      if (!result) throw new Error('No DDG result');
-      return result;
-    } catch (e) {
-      console.log('❌ DDG failed:', e.message);
-      throw e;
-    }
-  }
-
   async _fetchWeather(location) {
     // wttr.in returns a single compact line e.g. "Bangalore: +28C"
     // format=3 is the shortest format — well within BLE payload limits.
@@ -334,7 +325,7 @@ class GatewayService {
 
     let result = null;
 
-    // Weather queries → wttr.in directly (faster and more accurate than DDG)
+    // Weather queries → wttr.in only (Groq/Wikipedia have stale weather data — don't use them)
     if (this._isWeatherQuery(query)) {
       const location = this._extractLocation(query);
       console.log('[Gateway] Weather query detected, location:', location);
@@ -342,11 +333,12 @@ class GatewayService {
         result = await this._fetchWeather(location);
         console.log('[Gateway] 🌤️ Weather answer:', result);
       } catch (weatherErr) {
-        console.warn('[Gateway] ⚠️ Weather fetch failed:', weatherErr.message, '— falling through');
+        console.warn('[Gateway] ⚠️ Weather fetch failed:', weatherErr.message);
+        result = 'Weather information is currently unavailable. Try again later.';
       }
     }
 
-    // General queries: Groq → Wikipedia → DuckDuckGo (in priority order)
+    // General queries: Groq → Wikipedia (in priority order; skipped for weather)
     if (!result) {
       console.log('[Gateway] Trying Groq...');
       try {
@@ -368,14 +360,7 @@ class GatewayService {
     }
 
     if (!result) {
-      console.log('[Gateway] Wikipedia failed — trying DuckDuckGo...');
-      try {
-        result = await this._fetchDuckDuckGo(query);
-        console.log('[Gateway] 🔍 DuckDuckGo answer obtained');
-      } catch (ddgErr) {
-        console.warn('[Gateway] ⚠️ DuckDuckGo failed:', ddgErr.message);
-        result = `No instant answer found for "${query}". Try a different query.`;
-      }
+      result = `No answer found for "${query}". Try rephrasing or ask something else.`;
     }
 
     // Keep under ~800 chars to stay well within BLE payload limits
@@ -385,7 +370,7 @@ class GatewayService {
 
     // Only cache and share real answers — don't persist the "no result" fallback string
     // so future requests still try the network instead of returning a cached error.
-    const isFallback = result.startsWith('No instant answer found');
+    const isFallback = result.startsWith('No answer found for');
     if (!isFallback) {
       await this._saveCache(normalizedKey, result);
       // Share this answer with nearby mesh nodes so they can answer later without internet
@@ -419,7 +404,11 @@ class GatewayService {
 
       const timer = setTimeout(() => {
         this.pendingRequests.delete(requestId);
-        // Store for later (store-and-forward)
+        // Store for later (store-and-forward) — cap at 10, evict oldest
+        if (this.pendingQueue.length >= 10) {
+          this.pendingQueue.sort((a, b) => a.timestamp - b.timestamp);
+          this.pendingQueue.shift();
+        }
         this.pendingQueue.push({ requestId, query, timestamp: Date.now(), ttl: DEFAULT_TTL });
         reject(new Error('NO_GATEWAY_NEARBY'));
       }, REQUEST_TIMEOUT_MS);
@@ -515,15 +504,31 @@ class GatewayService {
 
     // Resolve waiting promise
     const pending = this.pendingRequests.get(request_id);
+
+    // Find in pending queue (covers case where 30s timer fired but mesh gateway responded anyway)
+    const queueIdx = this.pendingQueue.findIndex(item => item.requestId === request_id);
+    const queueItem = queueIdx >= 0 ? this.pendingQueue[queueIdx] : null;
+
+    // Recover the original query text from whichever store still has it
+    const queryText = pending?.query || queueItem?.query || '';
+
     if (pending) {
       clearTimeout(pending.timer);
       this.pendingRequests.delete(request_id);
       pending.resolve({ result, source: 'mesh', hops: DEFAULT_TTL - (message.ttl_remaining || 0) });
     }
 
-    // Notify screen via callback (handles the case where promise already timed out)
+    // Remove from queue if mesh answered before the retry loop ran
+    if (queueItem) {
+      this.pendingQueue.splice(queueIdx, 1);
+    }
+
+    // Notify screen via callback (handles the case where promise already timed out).
+    // delayed=true when the 30s promise already rejected — screen must surface this as an async result.
+    // delayed=false when the promise is still live — screen gets the result via the resolved promise,
+    // so the callback is informational only and the screen should ignore it.
     if (this.onQueryResultCallback) {
-      this.onQueryResultCallback({ request_id, result, query: message.query || '' });
+      this.onQueryResultCallback({ request_id, result, query: queryText, delayed: !pending });
     }
   }
 
@@ -537,7 +542,8 @@ class GatewayService {
       ttl_remaining: ttlRemaining,
       timestamp: Date.now(),
     };
-    this.bridgefyService.sendBroadcast(JSON.stringify(packet)).catch(() => {});
+    // Direct delivery — don't broadcast query results to every nearby device (privacy)
+    this.bridgefyService.sendDirectProtocol(destination, JSON.stringify(packet)).catch(() => {});
   }
 
   // ── Mesh cache sharing ──────────────────────────────────────────────────────
@@ -585,6 +591,12 @@ class GatewayService {
       const hasInternet = await this.checkInternet();
       if (!hasInternet) return;
 
+      // Evict stale items before processing (no point answering a query from 30+ min ago)
+      const now = Date.now();
+      this.pendingQueue = this.pendingQueue.filter(
+        item => (now - item.timestamp) < MAX_CACHE_AGE_MS
+      );
+
       const toProcess = [...this.pendingQueue];
       this.pendingQueue = [];
 
@@ -600,8 +612,10 @@ class GatewayService {
             });
           }
         } catch (_e) {
-          // Still failing — put back
-          this.pendingQueue.push(item);
+          // Still failing — put back, but respect the cap
+          if (this.pendingQueue.length < 10) {
+            this.pendingQueue.push(item);
+          }
         }
       }
     }, RETRY_INTERVAL_MS);
@@ -616,9 +630,14 @@ class GatewayService {
   _markSeen(id) {
     this.seenMessages.set(id, Date.now());
     if (this.seenMessages.size > SEEN_MESSAGES_MAX) {
+      // First pass: remove entries older than 5 minutes
       const cutoff = Date.now() - 5 * 60 * 1000;
       for (const [k, ts] of this.seenMessages) {
         if (ts < cutoff) this.seenMessages.delete(k);
+      }
+      // If still over cap (all entries are recent), trim oldest by insertion order
+      while (this.seenMessages.size > SEEN_MESSAGES_MAX) {
+        this.seenMessages.delete(this.seenMessages.keys().next().value);
       }
     }
   }
@@ -662,18 +681,6 @@ class GatewayService {
       return items;
     } catch (_e) {
       return [];
-    }
-  }
-
-  // ── Local weather widget ────────────────────────────────────────────────────
-  // Returns a compact string like "Bangalore: ⛅  +28°C" or null on failure.
-  // Uses IP-based location — no GPS or user input needed.
-  async getLocalWeather() {
-    try {
-      const text = await this._fetchWeather(null); // null → auto IP location
-      return text || null;
-    } catch (_e) {
-      return null;
     }
   }
 

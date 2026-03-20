@@ -5,8 +5,7 @@
 
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Geolocation from 'react-native-geolocation-service';
-
-const CACHE_KEY        = '@peerreach_weather_v2';
+import { WEATHER_CACHE_KEY as CACHE_KEY } from '../constants/storageKeys';
 const REFRESH_INTERVAL = 20 * 60 * 1000;  // fetch every 20 min
 const MAX_AGE_MS       = 3  * 60 * 60 * 1000; // treat cache stale after 3h
 
@@ -62,6 +61,8 @@ class WeatherService {
   setOnWeatherUpdated(cb) { this.onWeatherUpdated = cb; }
 
   startAutoRefresh() {
+    // Guard: don't stack multiple intervals if called more than once
+    if (this._timer) return;
     this._fetchAndBroadcast();
     this._timer = setInterval(() => this._fetchAndBroadcast(), REFRESH_INTERVAL);
   }
@@ -143,9 +144,9 @@ class WeatherService {
       for (let i = startIdx; i < Math.min(startIdx + 6, times.length); i++) {
         hourly.push({
           time:         times[i].substring(11, 16),  // "14:00"
-          temp:         Math.round(json.hourly.temperature_2m[i]),
-          code:         json.hourly.weathercode[i],
-          precipChance: json.hourly.precipitation_probability?.[i] ?? 0,
+          temp:         Math.round(json.hourly?.temperature_2m?.[i] ?? 0),
+          code:         json.hourly?.weathercode?.[i] ?? 0,
+          precipChance: json.hourly?.precipitation_probability?.[i] ?? 0,
         });
       }
 
@@ -153,10 +154,10 @@ class WeatherService {
       const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
       const daily = (json.daily?.time || []).slice(0, 3).map((dateStr, i) => ({
         label:       i === 0 ? 'Today' : DAY_NAMES[new Date(dateStr).getDay()],
-        high:        Math.round(json.daily.temperature_2m_max[i]),
-        low:         Math.round(json.daily.temperature_2m_min[i]),
-        code:        json.daily.weathercode[i],
-        precipChance: json.daily.precipitation_probability_max?.[i] ?? 0,
+        high:        Math.round(json.daily?.temperature_2m_max?.[i] ?? 0),
+        low:         Math.round(json.daily?.temperature_2m_min?.[i] ?? 0),
+        code:        json.daily?.weathercode?.[i] ?? 0,
+        precipChance: json.daily?.precipitation_probability_max?.[i] ?? 0,
       }));
 
       const cw = json.current_weather;

@@ -14,8 +14,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useTheme, useThemeCtx } from '../theme';
 import BridgefyService from '../services/BridgefyService';
-
-const DISPLAY_NAME_KEY = '@peerreach_display_name';
+import { DISPLAY_NAME_KEY, SHOW_SOS_FINDME_KEY } from '../constants/storageKeys';
 
 const THEME_OPTIONS = [
   { value: 'system', label: 'System' },
@@ -28,11 +27,17 @@ const SettingsScreen = () => {
   const { themePref, setThemePref } = useThemeCtx();
   const styles = useMemo(() => makeStyles(colors), [colors]);
 
-  const [displayName, setDisplayName] = useState('');
-  const [saving, setSaving]           = useState(false);
+  const [displayName, setDisplayName]       = useState('');
+  const [saving, setSaving]                 = useState(false);
+  const [sendBattery, setSendBattery]       = useState(true);
+  const [showSosFindMe, setShowSosFindMe]   = useState(true);
 
   useEffect(() => {
     setDisplayName(BridgefyService.getDisplayName() || '');
+    setSendBattery(BridgefyService.isBatterySendEnabled());
+    AsyncStorage.getItem(SHOW_SOS_FINDME_KEY).then(val => {
+      if (val !== null) setShowSosFindMe(val !== 'false');
+    }).catch(() => {});
   }, []);
 
   const saveDisplayName = async () => {
@@ -93,6 +98,41 @@ const SettingsScreen = () => {
           >
             <Text style={styles.resetBtnText}>Reset display name</Text>
           </TouchableOpacity>
+        </View>
+
+        {/* Privacy */}
+        <Text style={styles.sectionHeader}>Privacy</Text>
+        <View style={styles.card}>
+          <View style={styles.switchRow}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.rowLabel}>Share battery level</Text>
+              <Text style={styles.rowHint}>Include your battery % in messages so others can see if you're running low.</Text>
+            </View>
+            <Switch
+              value={sendBattery}
+              onValueChange={val => {
+                setSendBattery(val);
+                BridgefyService.setBatterySendEnabled(val);
+              }}
+              trackColor={{ false: colors.border, true: colors.primary }}
+              thumbColor="#fff"
+            />
+          </View>
+          <View style={[styles.switchRow, { marginTop: 16 }]}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.rowLabel}>Show SOS & Find Me</Text>
+              <Text style={styles.rowHint}>Show emergency SOS and Find Me buttons in the chat attach menu.</Text>
+            </View>
+            <Switch
+              value={showSosFindMe}
+              onValueChange={val => {
+                setShowSosFindMe(val);
+                AsyncStorage.setItem(SHOW_SOS_FINDME_KEY, val ? 'true' : 'false').catch(() => {});
+              }}
+              trackColor={{ false: colors.border, true: colors.primary }}
+              thumbColor="#fff"
+            />
+          </View>
         </View>
 
         {/* Theme */}

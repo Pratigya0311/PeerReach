@@ -24,7 +24,9 @@ class BridgefyService {
     this.deviceLocations   = new Map();  // deviceId → {lat, lng, ts}
     this.myLocation        = null;       // {lat, lng, ts}
     this._locationInterval = null;
+    this.onLocationUpdated = null;
     this._batteryWarningSent = false;
+    this._sendBattery = true;
     this.myDeviceId = null;
     this._apiKey = null;
     this._broadcastQueue  = [];
@@ -33,6 +35,7 @@ class BridgefyService {
     this.isInitialized = false;
     this.isInitializing = false;
     this.currentChatId = null;
+    this._deviceLostTimers = new Map();  // deviceId → setTimeout handle (grace-period before removal)
 
     // Handlers for special events
     this.onFindMeUpdateHandler = null;
@@ -101,6 +104,12 @@ class BridgefyService {
       try {
         console.log('📱 Device connected:', device);
         if (device.userId) {
+          // Cancel any pending grace-period removal for this device
+          if (this._deviceLostTimers.has(device.userId)) {
+            clearTimeout(this._deviceLostTimers.get(device.userId));
+            this._deviceLostTimers.delete(device.userId);
+            console.log('📱 Reconnected within grace period — removal cancelled:', device.userId);
+          }
           // Use hardware name only if we don't already have a display name from a prior announce
           const existing = this.connectedDevices.get(device.userId);
           const name = existing || device.deviceName || `Device_${device.userId.substring(0, 8)}`;
@@ -119,17 +128,32 @@ class BridgefyService {
       }
     });
 
-    bridgefyEmitter.addListener('onDeviceLost', async (device) => {
-      try {
-        console.log('📱 Device lost:', device);
-        if (device.userId) {
+    bridgefyEmitter.addListener('onDeviceLost', (device) => {
+      // Use an 8-second grace period before removing the device.
+      // BLE connections (especially during initial handshake) can briefly drop
+      // and re-establish within a few seconds. Without the delay, the device
+      // flashes in and out of the UI and, if the SDK retries the connection,
+      // we'd miss the reconnect because the map entry was already gone.
+      console.log('📱 Device lost (grace period started):', device);
+      if (!device.userId) return;
+      if (this._deviceLostTimers.has(device.userId)) return; // already counting down
+      const timer = setTimeout(async () => {
+        this._deviceLostTimers.delete(device.userId);
+        // If onDeviceConnected fired during the grace period, the timer was
+        // cancelled above — so reaching here means the device truly did not
+        // reconnect. Remove it now.
+        if (this.connectedDevices.has(device.userId)) {
+          console.log('📱 Device confirmed lost after grace period:', device.userId);
           this.connectedDevices.delete(device.userId);
-          await databaseService.updateDeviceStatus(device.userId, 'offline');
+          try {
+            await databaseService.updateDeviceStatus(device.userId, 'offline');
+          } catch (err) {
+            console.error('❌ onDeviceLost DB update error:', err);
+          }
           this.emitEvent('onDeviceLost', device);
         }
-      } catch (err) {
-        console.error('❌ onDeviceLost error:', err);
-      }
+      }, 8000);
+      this._deviceLostTimers.set(device.userId, timer);
     });
 
     // Message events
@@ -158,8 +182,17 @@ class BridgefyService {
 
     bridgefyEmitter.addListener('onDeviceListUpdated', async (data) => {
       try {
-        console.log('ðŸ”± Device list updated:', data?.devices?.length);
+        console.log('📱 Device list updated:', data?.devices?.length);
         if (data?.devices && Array.isArray(data.devices)) {
+          const freshIds = new Set(data.devices.map(d => d.id).filter(Boolean));
+
+          // Prune JS map to match native list (only when native returned ≥1 device)
+          if (freshIds.size > 0) {
+            for (const id of this.connectedDevices.keys()) {
+              if (!freshIds.has(id)) this.connectedDevices.delete(id);
+            }
+          }
+
           for (const device of data.devices) {
             if (device.id && device.name) {
               this.connectedDevices.set(device.id, device.name);
@@ -502,6 +535,8 @@ class BridgefyService {
       const battery = await this._getBattery();
       const envelope = JSON.stringify({
         type: 'text', text,
+        senderId: this.myDeviceId,
+        senderName: this.myDeviceName,
         _bat: battery,
       });
       console.log(`📤 Sending to ${receiverId}: ${text}`);
@@ -694,9 +729,12 @@ class BridgefyService {
         // Build the set of IDs currently reported by Bridgefy
         const freshIds = new Set(devices.map(d => d.id).filter(Boolean));
 
-        // Remove stale entries from our map (missed onDeviceLost events)
-        for (const id of this.connectedDevices.keys()) {
-          if (!freshIds.has(id)) this.connectedDevices.delete(id);
+        // Only prune stale entries if native returned at least one device.
+        // If native returns empty (BLE hiccup during navigation) we keep our map intact.
+        if (freshIds.size > 0) {
+          for (const id of this.connectedDevices.keys()) {
+            if (!freshIds.has(id)) this.connectedDevices.delete(id);
+          }
         }
 
         for (const device of devices) {
@@ -969,6 +1007,10 @@ class BridgefyService {
     this.emitEvent('onDeviceListUpdated', { deviceId: senderId, name });
   }
 
+  async sendDirectProtocol(receiverId, jsonString) {
+    await Bridgefy.sendPayload(receiverId, jsonString);
+  }
+
   async _sendAck(receiverId, messageId, ackType) {
     try {
       const packet = JSON.stringify({ type: 'ack', messageId, ackType });
@@ -1034,6 +1076,7 @@ class BridgefyService {
         (pos) => {
           this.myLocation = { lat: pos.coords.latitude, lng: pos.coords.longitude, ts: Date.now() };
           console.log('📍 Location updated:', this.myLocation.lat.toFixed(4), this.myLocation.lng.toFixed(4));
+          if (this.onLocationUpdated) this.onLocationUpdated(this.myLocation);
         },
         (err) => {
           // POSITION_UNAVAILABLE (2) or TIMEOUT (3) are expected when GPS is off — suppress noise
@@ -1050,6 +1093,25 @@ class BridgefyService {
 
   getMyLocation() {
     return this.myLocation || null;
+  }
+
+  setOnLocationUpdated(cb) { this.onLocationUpdated = cb; }
+
+  isBatterySendEnabled() { return this._sendBattery !== false; }
+  setBatterySendEnabled(val) { this._sendBattery = val; }
+
+  async getMyBattery() {
+    try {
+      const DeviceInfo = require('react-native-device-info');
+      const level = await DeviceInfo.getBatteryLevel();
+      return Math.round(level * 100);
+    } catch (_e) {
+      return null;
+    }
+  }
+
+  getDeviceBattery(deviceId) {
+    return this.deviceBatteries.get(deviceId) ?? null;
   }
 
   // ============ SOS BROADCAST ============
@@ -1166,6 +1228,25 @@ class BridgefyService {
       contentType: 'file',
       mediaData: { fileName, mimeType, fileSize, data: base64Data },
     });
+  }
+
+  async sendBroadcastFile(fileName, mimeType, base64Data, fileSize) {
+    if (!this.myDeviceId) throw new Error('Mesh not ready');
+    const MAX_FILE_BASE64 = 40960;
+    if (base64Data.length > MAX_FILE_BASE64) {
+      throw new Error(`File too large — max ~30 KB (got ${Math.round(base64Data.length * 0.75 / 1024)} KB)`);
+    }
+    const payload = JSON.stringify({
+      type: 'file',
+      text: `[File] ${fileName}`,
+      fileName, mimeType, fileSize, data: base64Data,
+      senderId: this.myDeviceId, senderName: this.myDeviceName,
+      timestamp: Date.now(), isBroadcast: true,
+    });
+    const response = await Bridgefy.sendBroadcast(payload);
+    const dbMsg = this._buildDbMessage({ responseId: response.id, content: payload, messageType: 'broadcast', isBroadcast: true });
+    await databaseService.saveMessage(dbMsg);
+    return this._buildAppMessage(dbMsg, { contentType: 'file', mediaData: { fileName, mimeType, fileSize, data: base64Data } });
   }
 
   // ============ SPECIAL EVENT HANDLERS ============

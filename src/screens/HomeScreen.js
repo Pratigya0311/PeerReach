@@ -8,8 +8,6 @@ import {
   StyleSheet,
   ActivityIndicator,
   Alert,
-  PermissionsAndroid,
-  Platform,
   RefreshControl,
   Modal,
   ScrollView,
@@ -19,12 +17,12 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect } from '@react-navigation/native';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 import MCIcon from 'react-native-vector-icons/MaterialCommunityIcons';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import BridgefyService from '../services/BridgefyService';
 import weatherService, { wmoInfo } from '../services/WeatherService';
 import { useTheme } from '../theme';
-
-const DISPLAY_NAME_KEY = '@peerreach_display_name';
+import { formatTimeAgo } from '../utils/timeFormat';
+import { requestBridgefyPermissions } from '../utils/permissions';
+import LoadingScreen from '../components/LoadingScreen';
 
 const SEARCH_DEBOUNCE_MS = 300;
 
@@ -44,15 +42,19 @@ const HomeScreen = ({ navigation }) => {
   const [myLocation, setMyLocation]           = useState(null);
   const [showLocationModal, setShowLocationModal] = useState(false);
   const [nearbyPeers, setNearbyPeers]         = useState([]);
+  const [myBattery, setMyBattery]             = useState(null);
 
   // Search state
-  const [searchQuery, setSearchQuery]   = useState('');
-  const [searchResults, setSearchResults] = useState([]);
-  const [isSearching, setIsSearching]   = useState(false);
-  const [namePromptVisible, setNamePromptVisible] = useState(false);
-  const [nameInput, setNameInput]       = useState('');
+  const [searchQuery, setSearchQuery]         = useState('');
+  const [deviceResults, setDeviceResults]     = useState([]);
+  const [messageResults, setMessageResults]   = useState([]);
+  const [isSearching, setIsSearching]         = useState(false);
   const searchTimerRef  = useRef(null);
   const navTimerRef     = useRef(null);
+  const infoIntervalRef = useRef(null);   // nearby peers — every 2 min
+  const batteryTimerRef = useRef(null);   // battery — every 5 min
+
+
 
   useFocusEffect(
     useCallback(() => {
@@ -62,6 +64,11 @@ const HomeScreen = ({ navigation }) => {
       if (name) setMyDeviceName(name);
     }, [])
   );
+
+  // Read battery immediately on mount — independent of Bridgefy
+  useEffect(() => {
+    BridgefyService.getMyBattery().then(b => { if (b != null) setMyBattery(b); }).catch(() => {});
+  }, []);
 
   useEffect(() => {
     console.log('🏠 HomeScreen mounted');
@@ -95,44 +102,17 @@ const HomeScreen = ({ navigation }) => {
       BridgefyService.setOnUnreadUpdatedHandler(null);
       BridgefyService.setOnDeviceListUpdatedHandler(null);
       weatherService.setOnWeatherUpdated(null);
+      BridgefyService.setOnLocationUpdated(null);
+      if (batteryTimerRef.current) clearInterval(batteryTimerRef.current);
       if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
       if (navTimerRef.current) clearTimeout(navTimerRef.current);
+      if (infoIntervalRef.current) clearInterval(infoIntervalRef.current);
     };
   }, []);
 
-  // Show name prompt if no custom display name has ever been saved
-  useEffect(() => {
-    AsyncStorage.getItem(DISPLAY_NAME_KEY).then(saved => {
-      if (!saved || !saved.trim()) setNamePromptVisible(true);
-    }).catch(() => {});
-  }, []);
 
   // ─── Permissions ──────────────────────────────────────────────────────────
-  const requestPermissions = async () => {
-    if (Platform.OS !== 'android') return true;
-    try {
-      if (Platform.Version >= 31) {
-        const result = await PermissionsAndroid.requestMultiple([
-          'android.permission.BLUETOOTH_SCAN',
-          'android.permission.BLUETOOTH_CONNECT',
-          'android.permission.BLUETOOTH_ADVERTISE',
-          'android.permission.ACCESS_FINE_LOCATION',
-        ]);
-        return (
-          result['android.permission.BLUETOOTH_CONNECT'] === 'granted' &&
-          result['android.permission.BLUETOOTH_SCAN'] === 'granted' &&
-          result['android.permission.BLUETOOTH_ADVERTISE'] === 'granted' &&
-          result['android.permission.ACCESS_FINE_LOCATION'] === 'granted'
-        );
-      }
-      const granted = await PermissionsAndroid.request(
-        PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION
-      );
-      return granted === PermissionsAndroid.RESULTS.GRANTED;
-    } catch (_e) {
-      return false;
-    }
-  };
+  const requestPermissions = requestBridgefyPermissions;
 
   // ─── Init ─────────────────────────────────────────────────────────────────
   const initializeBridgefy = async () => {
@@ -204,17 +184,27 @@ const HomeScreen = ({ navigation }) => {
     const cached = weatherService.getData();
     if (cached) setWeather(cached);
     weatherService.setOnWeatherUpdated((wd) => setWeather(wd));
-    // Seed location pill and nearby peers, then keep both fresh
-    const refreshLoc = () => {
-      const l = BridgefyService.getMyLocation();
-      setMyLocation(l || null);
-      BridgefyService.getConnectedDevices()
-        .then(devs => setNearbyPeers(devs))
-        .catch(() => {});
+    // Update location immediately whenever GPS fires (no waiting for poll interval)
+    BridgefyService.setOnLocationUpdated((loc) => setMyLocation(loc));
+    // Seed from cache in case callback already fired before we registered
+    const cachedLoc = BridgefyService.getMyLocation();
+    if (cachedLoc) setMyLocation(cachedLoc);
+
+    // Battery: read once now, then every 5 minutes (changes slowly)
+    const refreshBattery = () => {
+      BridgefyService.getMyBattery().then(b => { if (b != null) setMyBattery(b); }).catch(() => {});
     };
-    refreshLoc();
-    const locInterval = setInterval(refreshLoc, 30000);
-    return () => clearInterval(locInterval);
+    refreshBattery();
+    if (batteryTimerRef.current) clearInterval(batteryTimerRef.current);
+    batteryTimerRef.current = setInterval(refreshBattery, 5 * 60 * 1000);
+
+    // Nearby peers: refresh every 2 minutes (peer connections change more often)
+    const refreshPeers = () => {
+      BridgefyService.getConnectedDevices().then(devs => setNearbyPeers(devs)).catch(() => {});
+    };
+    refreshPeers();
+    if (infoIntervalRef.current) clearInterval(infoIntervalRef.current);
+    infoIntervalRef.current = setInterval(refreshPeers, 2 * 60 * 1000);
   };
   const handleBridgefyError  = (error) => {
     console.warn('⚠️ Bridgefy error:', error);
@@ -257,35 +247,42 @@ const HomeScreen = ({ navigation }) => {
     if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
 
     if (text.length < 2) {
-      setSearchResults([]);
+      setDeviceResults([]);
+      setMessageResults([]);
       setIsSearching(false);
       return;
     }
 
+    // Device results are instant — filter conversations by name
+    const lower = text.toLowerCase();
+    const matchedDevices = conversations.filter(c =>
+      c.name?.toLowerCase().includes(lower)
+    );
+    setDeviceResults(matchedDevices);
+
     setIsSearching(true);
     searchTimerRef.current = setTimeout(async () => {
       try {
-        const results = await BridgefyService.searchMessages(text);
-        setSearchResults(results);
+        const allMessages = await BridgefyService.searchMessages(text);
+        // Exclude messages already surfaced by a matched device conversation
+        const matchedIds = new Set(matchedDevices.map(c => c.id));
+        const extra = allMessages.filter(m => {
+          const convId = m.isBroadcast ? 'broadcast' : (m.isMine ? m.receiverId : m.senderId);
+          return !matchedIds.has(convId);
+        });
+        setMessageResults(extra);
       } catch (_e) {
-        setSearchResults([]);
+        setMessageResults([]);
       } finally {
         setIsSearching(false);
       }
     }, SEARCH_DEBOUNCE_MS);
   };
 
-  const confirmDisplayName = async () => {
-    const trimmed = nameInput.trim();
-    if (!trimmed) { Alert.alert('Name required', 'Please enter a display name.'); return; }
-    await BridgefyService.setDisplayName(trimmed);
-    setMyDeviceName(trimmed);
-    setNamePromptVisible(false);
-  };
-
   const clearSearch = () => {
     setSearchQuery('');
-    setSearchResults([]);
+    setDeviceResults([]);
+    setMessageResults([]);
     setIsSearching(false);
     if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
   };
@@ -293,18 +290,6 @@ const HomeScreen = ({ navigation }) => {
   const inSearchMode = searchQuery.length >= 2;
 
   // ─── Helpers ──────────────────────────────────────────────────────────────
-  const formatTimeAgo = (timestamp) => {
-    if (!timestamp) return '';
-    const diff    = Date.now() - timestamp;
-    const minutes = Math.floor(diff / 60000);
-    const hours   = Math.floor(diff / 3600000);
-    const days    = Math.floor(diff / 86400000);
-    if (minutes < 1)  return 'Just now';
-    if (minutes < 60) return `${minutes}m ago`;
-    if (hours < 24)   return `${hours}h ago`;
-    if (days < 7)     return `${days}d ago`;
-    return new Date(timestamp).toLocaleDateString();
-  };
 
   // ─── Render: conversation row ─────────────────────────────────────────────
   const renderConversation = ({ item }) => (
@@ -340,90 +325,98 @@ const HomeScreen = ({ navigation }) => {
     </TouchableOpacity>
   );
 
-  // ─── Render: search result row ────────────────────────────────────────────
-  const renderSearchResult = ({ item }) => {
-    const isPhoto    = item.contentType === 'photo';
-    const isLocation = item.contentType === 'location';
-    const preview    = isPhoto ? '[Photo]' : isLocation ? '[Location]' : (item.text || '');
-    const snippet    = preview.length > 90 ? preview.substring(0, 90) + '…' : preview;
-
-    let convName, convId, isBroadcast;
-    if (item.isBroadcast) {
-      convName    = 'Broadcast to All';
-      convId      = 'broadcast';
-      isBroadcast = true;
-    } else if (item.isMine) {
-      convId      = item.receiverId || null;
-      const conv  = conversations.find(c => c.id === convId);
-      convName    = conv?.name || (convId ? `Device ${convId.substring(0, 8)}` : 'Unknown');
-      isBroadcast = false;
-    } else {
-      convName    = item.senderName || 'Unknown';
-      convId      = item.senderId || null;
-      isBroadcast = false;
-    }
-
-    return (
-      <TouchableOpacity
-        style={styles.searchResultCard}
-        onPress={() => { if (convId) openChat({ id: convId, name: convName, isBroadcast }); }}
-      >
-        <View style={styles.searchResultHeader}>
-          <Text style={styles.searchResultFrom} numberOfLines={1}>{convName}</Text>
-          <Text style={styles.searchResultTime}>{formatTimeAgo(item.timestamp)}</Text>
+  // ─── Render: search results (device section + message section) ──────────────
+  const renderSearchResults = () => {
+    const hasDevices  = deviceResults.length > 0;
+    const hasMessages = messageResults.length > 0;
+    if (!hasDevices && !hasMessages) {
+      return (
+        <View style={styles.emptyState}>
+          <View style={styles.emptyIconCircle} />
+          <Text style={styles.emptyText}>No results found</Text>
+          <Text style={styles.emptySubtext}>Try a different search term</Text>
         </View>
-        <Text style={styles.searchResultText} numberOfLines={2}>{snippet}</Text>
-      </TouchableOpacity>
+      );
+    }
+    return (
+      <>
+        {hasDevices && (
+          <>
+            <Text style={styles.searchSectionLabel}>Conversations</Text>
+            {deviceResults.map(item => (
+              <TouchableOpacity
+                key={item.id}
+                style={styles.conversationCard}
+                onPress={() => openChat(item)}
+              >
+                <View style={[styles.avatar, item.isBroadcast ? styles.avatarBroadcast : styles.avatarDirect]}>
+                  <Text style={styles.avatarText}>
+                    {item.isBroadcast ? 'BC' : (item.name || '?')[0].toUpperCase()}
+                  </Text>
+                </View>
+                <View style={styles.conversationInfo}>
+                  <View style={styles.conversationHeader}>
+                    <Text style={styles.conversationName} numberOfLines={1}>{item.name}</Text>
+                    <Text style={styles.conversationTime}>{formatTimeAgo(item.timestamp)}</Text>
+                  </View>
+                  <Text style={styles.lastMessage} numberOfLines={1}>{item.lastMessage}</Text>
+                </View>
+              </TouchableOpacity>
+            ))}
+          </>
+        )}
+
+        {hasMessages && (
+          <>
+            <Text style={styles.searchSectionLabel}>Messages</Text>
+            {messageResults.map(item => {
+              const isPhoto    = item.contentType === 'photo';
+              const isLocation = item.contentType === 'location';
+              const preview    = isPhoto ? '[Photo]' : isLocation ? '[Location]' : (item.text || '');
+              const snippet    = preview.length > 90 ? preview.substring(0, 90) + '…' : preview;
+              let convId, convName, isBroadcast;
+              if (item.isBroadcast) {
+                convId = 'broadcast'; convName = 'Broadcast to All'; isBroadcast = true;
+              } else if (item.isMine) {
+                convId = item.receiverId || null;
+                const conv = conversations.find(c => c.id === convId);
+                convName = conv?.name || (convId ? `Device ${convId.substring(0, 8)}` : 'Unknown');
+                isBroadcast = false;
+              } else {
+                convId = item.senderId || null;
+                const conv = conversations.find(c => c.id === convId);
+                convName = conv?.name || item.senderName || (convId ? `Device ${convId.substring(0, 8)}` : 'Unknown');
+                isBroadcast = false;
+              }
+              return (
+                <TouchableOpacity
+                  key={item.id}
+                  style={styles.searchResultCard}
+                  onPress={() => { if (convId) openChat({ id: convId, name: convName, isBroadcast }); }}
+                >
+                  <View style={styles.searchResultHeader}>
+                    <Text style={styles.searchResultFrom} numberOfLines={1}>{convName}</Text>
+                    <Text style={styles.searchResultTime}>{formatTimeAgo(item.timestamp)}</Text>
+                  </View>
+                  <Text style={styles.searchResultText} numberOfLines={2}>{snippet}</Text>
+                </TouchableOpacity>
+              );
+            })}
+          </>
+        )}
+      </>
     );
   };
 
   // ─── Loading state ────────────────────────────────────────────────────────
   if (isLoading) {
-    return (
-      <SafeAreaView style={styles.loadingContainer}>
-        <ActivityIndicator size="large" color={colors.primary} />
-        <Text style={styles.loadingText}>Starting PeerReach...</Text>
-        <Text style={styles.loadingSubtext}>
-          {bridgefyStatus === 'initializing' && 'Initializing mesh network...'}
-          {bridgefyStatus === 'error'        && 'Failed to start. Please check permissions.'}
-        </Text>
-      </SafeAreaView>
-    );
+    const sub = bridgefyStatus === 'error' ? 'Failed to start. Please check permissions.' : 'Initializing mesh network...';
+    return <LoadingScreen message="Starting PeerReach..." subMessage={sub} />;
   }
 
   // ─── Main render ──────────────────────────────────────────────────────────
   return (
     <SafeAreaView style={styles.container}>
-
-      {/* First-launch display name prompt */}
-      <Modal visible={namePromptVisible} transparent animationType="fade">
-        <View style={styles.modalOverlay}>
-          <View style={styles.modalCard}>
-            <Text style={styles.modalTitle}>What's your name?</Text>
-            <Text style={styles.modalSubtitle}>
-              This is how you appear to other devices on the mesh.
-            </Text>
-            <TextInput
-              style={styles.modalInput}
-              placeholder="Enter display name"
-              placeholderTextColor="#999"
-              value={nameInput}
-              onChangeText={setNameInput}
-              maxLength={32}
-              autoFocus
-              returnKeyType="done"
-              onSubmitEditing={confirmDisplayName}
-            />
-            <TouchableOpacity
-              style={[styles.modalBtn, !nameInput.trim() && styles.modalBtnDisabled]}
-              onPress={confirmDisplayName}
-              disabled={!nameInput.trim()}
-            >
-              <Text style={styles.modalBtnText}>Continue</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-      </Modal>
 
       {/* Weather report modal */}
       <Modal visible={showWeatherModal} transparent animationType="slide" onRequestClose={() => setShowWeatherModal(false)}>
@@ -550,16 +543,17 @@ const HomeScreen = ({ navigation }) => {
         <View style={styles.wModalOverlay}>
           <View style={styles.wModalCard}>
             <View style={styles.wModalHandle} />
-            <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 16, gap: 8 }}>
-              <Icon name={myLocation ? 'my-location' : 'people'} size={22} color={colors.primary} />
+            <View style={styles.wModalTopRow}>
               <Text style={styles.wModalTitle}>
                 {myLocation ? 'My Last Known Location' : 'Nearby Devices'}
               </Text>
+              <TouchableOpacity onPress={() => setShowLocationModal(false)}>
+                <Icon name="close" size={22} color={colors.textMuted} />
+              </TouchableOpacity>
             </View>
             {myLocation ? (() => {
-              const ageSec  = Math.floor((Date.now() - myLocation.ts) / 1000);
-              const ageMins = Math.floor(ageSec / 60);
-              const ageStr  = ageSec < 30 ? 'Just now' : ageMins < 60 ? `${ageMins}m ago` : `${Math.floor(ageMins / 60)}h ago`;
+              const ageMins = Math.floor((Date.now() - myLocation.ts) / 60000);
+              const ageStr  = ageMins === 0 ? 'Just now' : `${ageMins} min ago`;
               return (
                 <>
                   <View style={styles.locRow}>
@@ -570,9 +564,11 @@ const HomeScreen = ({ navigation }) => {
                     <Text style={styles.locLabel}>Longitude</Text>
                     <Text style={styles.locValue}>{myLocation.lng.toFixed(6)}</Text>
                   </View>
-                  <View style={[styles.locRow, { marginTop: 8 }]}>
-                    <Icon name="access-time" size={14} color={colors.textMuted} />
-                    <Text style={[styles.locLabel, { marginLeft: 4 }]}>Fixed {ageStr}</Text>
+                  <View style={styles.wFooter}>
+                    <View style={[styles.wSourceBadge, styles.wSourceGps]}>
+                      <Text style={styles.wSourceText}>GPS</Text>
+                    </View>
+                    <Text style={styles.wAgeText}>Fixed {ageStr}</Text>
                   </View>
                   <Text style={styles.locPrivacyNote}>
                     This location is stored only on your device and is never shared automatically.
@@ -605,9 +601,6 @@ const HomeScreen = ({ navigation }) => {
                 <Text style={{ color: colors.textMuted, marginTop: 8 }}>No GPS fix and no nearby devices</Text>
               </View>
             )}
-            <TouchableOpacity style={styles.wCloseBtn} onPress={() => setShowLocationModal(false)}>
-              <Text style={styles.wCloseBtnText}>Close</Text>
-            </TouchableOpacity>
           </View>
         </View>
       </Modal>
@@ -634,39 +627,83 @@ const HomeScreen = ({ navigation }) => {
               style={styles.settingsBtn}
               onPress={() => navigation.navigate('Settings')}
             >
-              <Text style={styles.settingsIcon}>{'\ue8b8'}</Text>
+              <Icon name="settings" size={20} color="#FFFFFF" />
             </TouchableOpacity>
           </View>
         </View>
         <Text style={styles.subtitle}>
           {myDeviceName} · {myDeviceId ? myDeviceId.substring(0, 8) + '...' : 'Unknown'}
         </Text>
+        {/* Status + info row — all indicators aligned on one line */}
         <View style={styles.statusRow}>
-          <View style={[styles.statusDot, bridgefyStatus === 'ready' ? styles.dotOnline : styles.dotOffline]} />
-          <Text style={styles.status}>
-            {bridgefyStatus === 'ready' ? 'Online' : 'Offline'}
-            {conversations.length > 0 && ` · ${conversations.length} conversation${conversations.length !== 1 ? 's' : ''}`}
-          </Text>
-          {weather?.current ? (
-            <TouchableOpacity style={styles.weatherWidget} onPress={() => setShowWeatherModal(true)}>
-              <MCIcon name={wmoInfo(weather.current.code).icon} size={14} color={wmoInfo(weather.current.code).color} />
-              <Text style={styles.weatherText}>{weather.current.temp}°  {weather.city}</Text>
+          {/* Online/Offline */}
+          <View style={[
+            styles.statusDot,
+            bridgefyStatus === 'ready' ? styles.dotOnline :
+            bridgefyStatus === 'initializing' ? styles.dotConnecting :
+            styles.dotOffline,
+          ]} />
+          {bridgefyStatus === 'error' ? (
+            <TouchableOpacity onPress={initializeBridgefy}>
+              <Text style={[styles.status, { color: '#FF5252' }]}>Offline — Tap to retry</Text>
             </TouchableOpacity>
-          ) : null}
-          {(myLocation || nearbyPeers.length > 0) ? (
-            <TouchableOpacity style={styles.weatherWidget} onPress={() => setShowLocationModal(true)}>
-              <Icon
-                name={myLocation ? 'my-location' : 'people'}
-                size={13}
-                color={colors.headerStatusText}
-              />
-              <Text style={styles.weatherText}>
-                {myLocation
-                  ? `${myLocation.lat.toFixed(3)}, ${myLocation.lng.toFixed(3)}`
-                  : `${nearbyPeers.length} nearby`}
-              </Text>
-            </TouchableOpacity>
-          ) : null}
+          ) : (
+            <Text style={styles.status}>
+              {bridgefyStatus === 'ready'
+                ? nearbyPeers.length > 0 ? `Online · ${nearbyPeers.length} peer${nearbyPeers.length > 1 ? 's' : ''}` : 'Online · no peers'
+                : 'Connecting'}
+            </Text>
+          )}
+
+          {/* Battery */}
+          {myBattery != null && (
+            <>
+              <Text style={styles.statusSep}>·</Text>
+              <View style={styles.statusPill}>
+                <Icon
+                  name={myBattery > 60 ? 'battery-std' : myBattery > 15 ? 'battery-2-bar' : 'battery-alert'}
+                  size={13}
+                  color={myBattery <= 15 ? '#FF5252' : colors.headerStatusText}
+                />
+                <Text style={[styles.statusPillText, myBattery <= 15 && { color: '#FF5252' }]}>
+                  {myBattery}%
+                </Text>
+              </View>
+            </>
+          )}
+
+          {/* Weather */}
+          {weather?.current && (() => {
+            const wi = wmoInfo(weather.current.code);
+            return (
+              <>
+                <Text style={styles.statusSep}>·</Text>
+                <TouchableOpacity style={styles.statusPill} onPress={() => setShowWeatherModal(true)}>
+                  <MCIcon name={wi.icon} size={13} color={wi.color} />
+                  <Text style={styles.statusPillText}>
+                    {weather.current.temp}°  {weather.city || 'Unknown'}
+                  </Text>
+                </TouchableOpacity>
+              </>
+            );
+          })()}
+
+          {/* Location */}
+          <Text style={styles.statusSep}>·</Text>
+          <TouchableOpacity style={styles.statusPill} onPress={() => setShowLocationModal(true)}>
+            <Icon
+              name={myLocation ? 'my-location' : nearbyPeers.length > 0 ? 'people' : 'location-off'}
+              size={13}
+              color={myLocation ? '#81D4FA' : colors.headerStatusText}
+            />
+            <Text style={styles.statusPillText}>
+              {myLocation
+                ? `${myLocation.lat.toFixed(3)}, ${myLocation.lng.toFixed(3)}`
+                : nearbyPeers.length > 0
+                  ? `${nearbyPeers.length} nearby`
+                  : 'No location'}
+            </Text>
+          </TouchableOpacity>
         </View>
       </View>
 
@@ -680,6 +717,7 @@ const HomeScreen = ({ navigation }) => {
             lastMessage: 'Send messages to all nearby devices',
           })}
         >
+          <Icon name="cell-tower" size={16} color="#fff" style={styles.actionBtnIcon} />
           <Text style={styles.actionButtonText}>Broadcast</Text>
         </TouchableOpacity>
 
@@ -687,13 +725,15 @@ const HomeScreen = ({ navigation }) => {
           style={[styles.actionButton, styles.newChatButton]}
           onPress={() => navigation.navigate('Devices')}
         >
-          <Text style={styles.actionButtonText}>+ New Chat</Text>
+          <Icon name="add-comment" size={16} color="#fff" style={styles.actionBtnIcon} />
+          <Text style={styles.actionButtonText}>New Chat</Text>
         </TouchableOpacity>
 
         <TouchableOpacity
           style={[styles.actionButton, styles.askMeshButton]}
           onPress={() => navigation.navigate('MeshQuery')}
         >
+          <Icon name="hub" size={16} color="#fff" style={styles.actionBtnIcon} />
           <Text style={styles.actionButtonText}>Ask Mesh</Text>
         </TouchableOpacity>
       </View>
@@ -717,52 +757,45 @@ const HomeScreen = ({ navigation }) => {
       </View>
 
       {/* List — conversations OR search results */}
-      {inSearchMode && isSearching ? (
-        <View style={styles.searchLoadingRow}>
-          <ActivityIndicator size="small" color={colors.primary} />
-          <Text style={styles.searchLoadingText}>Searching...</Text>
-        </View>
+      {inSearchMode ? (
+        <ScrollView
+          style={{ flex: 1 }}
+          contentContainerStyle={styles.list}
+          keyboardShouldPersistTaps="handled"
+        >
+          {isSearching ? (
+            <View style={styles.searchLoadingRow}>
+              <ActivityIndicator size="small" color={colors.primary} />
+              <Text style={styles.searchLoadingText}>Searching...</Text>
+            </View>
+          ) : renderSearchResults()}
+        </ScrollView>
       ) : (
         <FlatList
-          data={inSearchMode ? searchResults : conversations}
-          renderItem={inSearchMode ? renderSearchResult : renderConversation}
-          keyExtractor={(item) =>
-            inSearchMode ? `sr_${item.id}` : item.id
-          }
+          data={conversations}
+          renderItem={renderConversation}
+          keyExtractor={(item) => item.id}
           contentContainerStyle={styles.list}
           keyboardShouldPersistTaps="handled"
           refreshControl={
-            !inSearchMode ? (
-              <RefreshControl
-                refreshing={refreshing}
-                onRefresh={loadData}
-                colors={[colors.primary]}
+            <RefreshControl
+              refreshing={refreshing}
+              onRefresh={loadData}
+              colors={[colors.primary]}
               tintColor={colors.primary}
-              />
-            ) : undefined
+            />
           }
           ListEmptyComponent={
-            inSearchMode ? (
-              <View style={styles.emptyState}>
-                <View style={styles.emptyIconCircle} />
-                <Text style={styles.emptyText}>No results found</Text>
-                <Text style={styles.emptySubtext}>Try a different search term</Text>
-              </View>
-            ) : (
-              <View style={styles.emptyState}>
-                <View style={styles.emptyIconCircle} />
-                <Text style={styles.emptyText}>No conversations yet</Text>
-                <Text style={styles.emptySubtext}>
-                  Start a broadcast or chat with nearby devices
-                </Text>
-                <TouchableOpacity
-                  style={styles.emptyButton}
-                  onPress={() => BridgefyService.getConnectedDevices().then(loadData)}
-                >
-                  <Text style={styles.emptyButtonText}>Refresh Devices</Text>
-                </TouchableOpacity>
-              </View>
-            )
+            <View style={styles.emptyState}>
+              <View style={styles.emptyIconCircle} />
+              <Text style={styles.emptyText}>No conversations yet</Text>
+              <Text style={styles.emptySubtext}>
+                Start a broadcast or chat with nearby devices
+              </Text>
+              <TouchableOpacity style={styles.emptyButton} onPress={loadData}>
+                <Text style={styles.emptyButtonText}>Refresh Devices</Text>
+              </TouchableOpacity>
+            </View>
           }
         />
       )}
@@ -772,13 +805,7 @@ const HomeScreen = ({ navigation }) => {
 
 // ─── Styles (theme-aware) ────────────────────────────────────────────────────
 const makeStyles = (colors) => StyleSheet.create({
-  container:      { flex: 1, backgroundColor: colors.background },
-  loadingContainer: {
-    flex: 1, justifyContent: 'center', alignItems: 'center',
-    backgroundColor: colors.background, padding: 20,
-  },
-  loadingText:    { fontSize: 18, fontWeight: '600', color: colors.text, marginTop: 20, marginBottom: 8 },
-  loadingSubtext: { fontSize: 14, color: colors.textSecondary, textAlign: 'center', paddingHorizontal: 40 },
+  container: { flex: 1, backgroundColor: colors.background },
 
   // Header
   header: {
@@ -792,11 +819,6 @@ const makeStyles = (colors) => StyleSheet.create({
     backgroundColor: 'rgba(255,255,255,0.15)',
     borderRadius: 6,
     padding: 6,
-  },
-  settingsIcon: {
-    fontFamily: 'MaterialIcons',
-    fontSize: 20,
-    color: '#FFFFFF',
   },
   headerActions: {
     flexDirection: 'row', alignItems: 'center', gap: 6,
@@ -817,11 +839,15 @@ const makeStyles = (colors) => StyleSheet.create({
   },
   headerBadgeText: { color: colors.onColor, fontSize: 12, fontWeight: 'bold' },
   subtitle: { fontSize: 14, color: colors.headerSubtitle, marginBottom: 4 },
-  statusRow: { flexDirection: 'row', alignItems: 'center' },
-  statusDot: { width: 8, height: 8, borderRadius: 4, marginRight: 6 },
-  dotOnline:  { backgroundColor: colors.success },
-  dotOffline: { backgroundColor: colors.error },
-  status:      { fontSize: 12, color: colors.headerStatusText },
+  statusRow:     { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', marginBottom: 4, gap: 4 },
+  statusDot:     { width: 8, height: 8, borderRadius: 8, overflow: 'hidden' },
+  dotOnline:      { backgroundColor: colors.success },
+  dotConnecting:  { backgroundColor: colors.warning },
+  dotOffline:     { backgroundColor: colors.error },
+  status:        { fontSize: 12, color: colors.headerStatusText },
+  statusSep:     { fontSize: 12, color: colors.headerStatusText, opacity: 0.5, marginHorizontal: 1 },
+  statusPill:    { flexDirection: 'row', alignItems: 'center', gap: 3 },
+  statusPillText:{ fontSize: 12, color: colors.headerStatusText },
 
   // Action buttons
   actionButtons: {
@@ -831,7 +857,8 @@ const makeStyles = (colors) => StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: colors.border,
   },
-  actionButton: { flex: 1, padding: 12, borderRadius: 10, alignItems: 'center', marginHorizontal: 4 },
+  actionButton: { flex: 1, padding: 12, borderRadius: 10, alignItems: 'center', marginHorizontal: 4, flexDirection: 'row', justifyContent: 'center', gap: 6 },
+  actionBtnIcon: { marginTop: 1 },
   broadcastButton: { backgroundColor: colors.warning },
   newChatButton:   { backgroundColor: colors.success },
   askMeshButton:   { backgroundColor: colors.accent },
@@ -863,6 +890,12 @@ const makeStyles = (colors) => StyleSheet.create({
     justifyContent: 'center', padding: 20, gap: 10,
   },
   searchLoadingText: { fontSize: 14, color: colors.textSecondary },
+
+  searchSectionLabel: {
+    fontSize: 11, fontWeight: '700', color: colors.textMuted,
+    textTransform: 'uppercase', letterSpacing: 0.5,
+    marginBottom: 8, marginTop: 4,
+  },
 
   // Search result card
   searchResultCard: {
@@ -940,9 +973,6 @@ const makeStyles = (colors) => StyleSheet.create({
   emptyButton:  { backgroundColor: colors.primary, paddingHorizontal: 24, paddingVertical: 12, borderRadius: 8 },
   emptyButtonText: { color: colors.onColor, fontSize: 16, fontWeight: '600' },
 
-  // Weather widget (status row)
-  weatherWidget: { flexDirection: 'row', alignItems: 'center', gap: 4, marginLeft: 10 },
-  weatherText:   { fontSize: 12, color: colors.headerStatusText, opacity: 0.9 },
 
   // Weather report modal
   wModalOverlay: {
@@ -997,38 +1027,12 @@ const makeStyles = (colors) => StyleSheet.create({
   wStaleBadge:  { flexDirection: 'row', alignItems: 'center', gap: 3, backgroundColor: '#E6510020', borderRadius: 10, paddingHorizontal: 8, paddingVertical: 2 },
   wStaleText:   { fontSize: 11, color: '#E65100', fontWeight: '500' },
   wModalTitle:  { fontSize: 17, fontWeight: '700', color: colors.text },
-  wCloseBtn:    { marginTop: 20, backgroundColor: colors.primary, borderRadius: 10, paddingVertical: 12, alignItems: 'center' },
-  wCloseBtnText:{ color: '#fff', fontWeight: '600', fontSize: 15 },
 
   // Location pill styles
   locRow:         { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: colors.border },
   locLabel:       { fontSize: 13, color: colors.textMuted },
   locValue:       { fontSize: 15, fontWeight: '600', color: colors.text, fontVariant: ['tabular-nums'] },
   locPrivacyNote: { fontSize: 12, color: colors.textMuted, marginTop: 16, lineHeight: 17, fontStyle: 'italic' },
-
-  // First-launch name modal
-  modalOverlay: {
-    flex: 1, backgroundColor: 'rgba(0,0,0,0.55)',
-    justifyContent: 'center', alignItems: 'center', padding: 32,
-  },
-  modalCard: {
-    width: '100%', backgroundColor: colors.surface,
-    borderRadius: 16, padding: 24,
-  },
-  modalTitle:    { fontSize: 22, fontWeight: '700', color: colors.text, marginBottom: 8 },
-  modalSubtitle: { fontSize: 14, color: colors.textMuted, marginBottom: 20, lineHeight: 20 },
-  modalInput: {
-    backgroundColor: colors.surfaceVariant,
-    borderRadius: 8, borderWidth: 1, borderColor: colors.border,
-    paddingHorizontal: 14, paddingVertical: 12,
-    fontSize: 16, color: colors.text, marginBottom: 16,
-  },
-  modalBtn: {
-    backgroundColor: colors.primary, borderRadius: 8,
-    paddingVertical: 13, alignItems: 'center',
-  },
-  modalBtnDisabled: { backgroundColor: colors.border },
-  modalBtnText: { color: '#fff', fontWeight: '700', fontSize: 16 },
 });
 
 export default HomeScreen;

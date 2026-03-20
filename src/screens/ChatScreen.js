@@ -6,26 +6,28 @@ import {
   TextInput,
   TouchableOpacity,
   StyleSheet,
-  KeyboardAvoidingView,
-  Platform,
+  Keyboard,
   ActivityIndicator,
   Image,
   Modal,
   Dimensions,
   Linking,
-  PermissionsAndroid,
   Alert,
   Share,
   Vibration,
 } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useFocusEffect } from '@react-navigation/native';
-import { useHeaderHeight } from '@react-navigation/elements';
 import { launchImageLibrary } from 'react-native-image-picker';
 import Geolocation from 'react-native-geolocation-service';
 import Icon from 'react-native-vector-icons/MaterialIcons';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import BridgefyService from '../services/BridgefyService';
 import { useTheme } from '../theme';
+import { formatTime, formatDateTime, formatElapsed } from '../utils/timeFormat';
+import { requestLocationPermission } from '../utils/permissions';
+import LoadingScreen from '../components/LoadingScreen';
+import { SHOW_SOS_FINDME_KEY } from '../constants/storageKeys';
 
 // Max base64 length (~45 KB raw image → ~60 KB base64) to stay within Bridgefy's 64 KB limit
 const MAX_BASE64_LENGTH = 61440;
@@ -45,7 +47,6 @@ const ChatScreen = ({ route, navigation }) => {
   const colors = useTheme();
   const styles = useMemo(() => makeStyles(colors), [colors]);
   const insets = useSafeAreaInsets();
-  const headerHeight = useHeaderHeight();
 
   const [messages, setMessages]             = useState([]);
   const [pinnedMessages, setPinnedMessages] = useState([]);
@@ -58,16 +59,31 @@ const ChatScreen = ({ route, navigation }) => {
   const [showScrollBtn, setShowScrollBtn]   = useState(false);
   const [isDeviceOnline, setIsDeviceOnline] = useState(true);
   const [showAttachMenu, setShowAttachMenu] = useState(false);
+  const [peerBattery, setPeerBattery]       = useState(null);
+  const [msgInfo, setMsgInfo]               = useState(null); // message whose delivery info panel is open
+  const [keyboardHeight, setKeyboardHeight] = useState(0);
+  const [showSosFindMe, setShowSosFindMe]   = useState(true);
 
   const flatListRef      = useRef(null);
   const isMountedRef     = useRef(true);
   const typingTimerRef   = useRef(null);   // clears typing indicator after 4s
   const typingSentRef    = useRef(0);      // timestamp of last typing packet sent
 
+  // Manual keyboard handling — adjustNothing in manifest means Android won't resize,
+  // so we shift the entire screen up by exactly the keyboard height ourselves.
+  useEffect(() => {
+    const show = Keyboard.addListener('keyboardDidShow', e => setKeyboardHeight(e.endCoordinates.height));
+    const hide = Keyboard.addListener('keyboardDidHide', () => setKeyboardHeight(0));
+    return () => { show.remove(); hide.remove(); };
+  }, []);
+
   useFocusEffect(
     useCallback(() => {
       BridgefyService.setCurrentChat(deviceId);
       BridgefyService.markAsRead(deviceId, isBroadcast);
+      AsyncStorage.getItem(SHOW_SOS_FINDME_KEY).then(val => {
+        if (val !== null) setShowSosFindMe(val !== 'false');
+      }).catch(() => {});
       return () => { BridgefyService.setCurrentChat(null); };
     }, [deviceId, isBroadcast])
   );
@@ -78,7 +94,19 @@ const ChatScreen = ({ route, navigation }) => {
       title: deviceName,
       headerBackTitle: 'Back',
       headerRight: () => (
-        <View style={{ flexDirection: 'row', alignItems: 'center', marginRight: 8 }}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', marginRight: 8, gap: 4 }}>
+          {!isBroadcast && peerBattery != null && (
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 2, marginRight: 4 }}>
+              <Icon
+                name={peerBattery > 20 ? 'battery-std' : 'battery-alert'}
+                size={16}
+                color={peerBattery <= 20 ? '#FF5252' : '#FFFFFF'}
+              />
+              <Text style={{ color: peerBattery <= 20 ? '#FF5252' : '#FFFFFF', fontSize: 12, fontWeight: '600' }}>
+                {peerBattery}%
+              </Text>
+            </View>
+          )}
           <TouchableOpacity
             onPress={() => navigation.navigate('MediaGallery', {
               conversationId: deviceId,
@@ -95,14 +123,26 @@ const ChatScreen = ({ route, navigation }) => {
         </View>
       ),
     });
+    // Seed peer battery from in-memory map
+    const initialBat = BridgefyService.getDeviceBattery(deviceId);
+    if (initialBat != null) setPeerBattery(initialBat);
+
     loadStoredMessages();
     loadPinnedMessages();
     BridgefyService.setMessageListener(handleNewMessage);
     BridgefyService.setOnTypingHandler(handleTyping);
     BridgefyService.markAsRead(deviceId, isBroadcast);
-    BridgefyService.setOnMessageStatusUpdatedHandler(({ messageId, status }) => {
+    BridgefyService.setOnMessageStatusUpdatedHandler(({ messageId, status, deliveredAt, readAt }) => {
       if (!isMountedRef.current) return;
-      setMessages(prev => prev.map(m => m.id === messageId ? { ...m, deliveryStatus: status } : m));
+      setMessages(prev => prev.map(m => {
+        if (m.id !== messageId) return m;
+        return {
+          ...m,
+          deliveryStatus: status,
+          ...(deliveredAt != null && { deliveredAt }),
+          ...(readAt      != null && { readAt }),
+        };
+      }));
     });
 
     // Track whether the target device is reachable (event-driven, no polling)
@@ -113,11 +153,15 @@ const ChatScreen = ({ route, navigation }) => {
     }
     BridgefyService.setDeviceListListener((data) => {
       if (!isMountedRef.current || isBroadcast) return;
-      const devices = data?.devices || [];
-      setIsDeviceOnline(devices.some(d => d.id === deviceId));
-      // If this device announced an updated display name, refresh the header
-      if (data?.deviceId === deviceId && data?.name) {
-        navigation.setOptions({ title: data.name });
+      // Only update online status when we get a real device list (not announce events which have no devices array)
+      if (data?.devices && Array.isArray(data.devices)) {
+        setIsDeviceOnline(data.devices.some(d => d.id === deviceId));
+      }
+      // If this device announced an updated display name or battery, refresh
+      if (data?.deviceId === deviceId) {
+        if (data?.name) navigation.setOptions({ title: data.name });
+        const freshBat = BridgefyService.getDeviceBattery(deviceId);
+        if (freshBat != null) setPeerBattery(freshBat);
       }
     });
 
@@ -130,6 +174,42 @@ const ChatScreen = ({ route, navigation }) => {
       if (typingTimerRef.current) clearTimeout(typingTimerRef.current);
     };
   }, [deviceId, deviceName, isBroadcast, navigation]);
+
+  // Re-render header when peer battery updates
+  useEffect(() => {
+    if (isBroadcast) return;
+    navigation.setOptions({
+      headerRight: () => (
+        <View style={{ flexDirection: 'row', alignItems: 'center', marginRight: 8, gap: 4 }}>
+          {peerBattery != null && (
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 2, marginRight: 4 }}>
+              <Icon
+                name={peerBattery > 20 ? 'battery-std' : 'battery-alert'}
+                size={16}
+                color={peerBattery <= 20 ? '#FF5252' : '#FFFFFF'}
+              />
+              <Text style={{ color: peerBattery <= 20 ? '#FF5252' : '#FFFFFF', fontSize: 12, fontWeight: '600' }}>
+                {peerBattery}%
+              </Text>
+            </View>
+          )}
+          <TouchableOpacity
+            onPress={() => navigation.navigate('MediaGallery', {
+              conversationId: deviceId,
+              conversationName: deviceName,
+              isBroadcast,
+            })}
+            style={{ padding: 6 }}
+          >
+            <Icon name="perm-media" size={22} color="#FFFFFF" />
+          </TouchableOpacity>
+          <TouchableOpacity onPress={confirmClearHistory} style={{ padding: 6 }}>
+            <Icon name="delete-sweep" size={22} color="#FFFFFF" />
+          </TouchableOpacity>
+        </View>
+      ),
+    });
+  }, [peerBattery, isBroadcast, navigation, deviceId, deviceName]);
 
   const loadStoredMessages = async () => {
     try {
@@ -341,7 +421,9 @@ const ChatScreen = ({ route, navigation }) => {
         return;
       }
       setIsSending(true);
-      const sent = await BridgefyService.sendFile(deviceId, fileName, mimeType, base64, fileSize);
+      const sent = isBroadcast
+        ? await BridgefyService.sendBroadcastFile(fileName, mimeType, base64, fileSize)
+        : await BridgefyService.sendFile(deviceId, fileName, mimeType, base64, fileSize);
       addMessage(sent);
     } catch (err) {
       if (DocumentPicker.isCancel(err)) return; // user cancelled
@@ -351,10 +433,10 @@ const ChatScreen = ({ route, navigation }) => {
     }
   };
 
-  // ─── Send SOS (broadcast only) ────────────────────────────────────────────
+  // ─── Send SOS (always broadcasts to all nearby devices) ──────────────────
   const sendSOS = () => {
     Alert.alert(
-      '🚨 Send SOS',
+      'Send SOS',
       'This will broadcast an emergency alert with your location to all nearby devices.',
       [
         { text: 'Cancel', style: 'cancel' },
@@ -364,15 +446,7 @@ const ChatScreen = ({ route, navigation }) => {
           onPress: async () => {
             if (isSending) return;
             try {
-              if (Platform.OS === 'android') {
-                const granted = await PermissionsAndroid.request(
-                  PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION
-                );
-                if (granted !== PermissionsAndroid.RESULTS.GRANTED) {
-                  Alert.alert('Permission denied', 'Location is required for SOS.');
-                  return;
-                }
-              }
+              if (!await requestLocationPermission('Location is required for SOS.')) return;
               setIsSending(true);
               Geolocation.getCurrentPosition(
                 async (pos) => {
@@ -406,19 +480,11 @@ const ChatScreen = ({ route, navigation }) => {
     );
   };
 
-  // ─── Send Find Me request (direct chat only) ──────────────────────────────
+  // ─── Send Find Me request ─────────────────────────────────────────────────
   const sendFindMe = async () => {
     if (isSending) return;
     try {
-      if (Platform.OS === 'android') {
-        const granted = await PermissionsAndroid.request(
-          PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION
-        );
-        if (granted !== PermissionsAndroid.RESULTS.GRANTED) {
-          Alert.alert('Permission denied', 'Location is required to share your position.');
-          return;
-        }
-      }
+      if (!await requestLocationPermission('Location is required to share your position.')) return;
       setIsSending(true);
       Geolocation.getCurrentPosition(
         async (pos) => {
@@ -479,20 +545,7 @@ const ChatScreen = ({ route, navigation }) => {
   const shareLocation = async () => {
     if (isSending) return;
     try {
-      if (Platform.OS === 'android') {
-        const granted = await PermissionsAndroid.request(
-          PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
-          {
-            title: 'Location Permission',
-            message: 'PeerReach needs location access to share your position.',
-            buttonPositive: 'Allow',
-          }
-        );
-        if (granted !== PermissionsAndroid.RESULTS.GRANTED) {
-          Alert.alert('Permission denied', 'Location permission is required to share your location.');
-          return;
-        }
-      }
+      if (!await requestLocationPermission('Location permission is required to share your location.')) return;
       setIsSending(true);
       Geolocation.getCurrentPosition(
         async (position) => {
@@ -790,7 +843,7 @@ const ChatScreen = ({ route, navigation }) => {
     );
   };
 
-  const renderMessage = ({ item }) => {
+  const renderMessage = useCallback(({ item }) => {
     // ── Date divider ──────────────────────────────────────────────────────────
     if (item._isDivider) {
       return (
@@ -846,11 +899,16 @@ const ChatScreen = ({ route, navigation }) => {
               const ds = item.deliveryStatus;
               if (isSending || ds === 'sending')
                 return <Text style={[styles.tickText, { opacity: 0.5 }]}>···</Text>;
-              if (ds === 'read')
-                return <Text style={[styles.tickText, { color: '#64B5F6' }]}>✓✓</Text>;
-              if (ds === 'delivered')
-                return <Text style={[styles.tickText, { opacity: 0.75 }]}>✓✓</Text>;
-              return <Text style={[styles.tickText, { opacity: 0.75 }]}>✓</Text>;
+              const tickEl = ds === 'read'
+                ? <Text style={[styles.tickText, { color: '#64B5F6' }]}>✓✓</Text>
+                : ds === 'delivered'
+                  ? <Text style={[styles.tickText, { opacity: 0.75 }]}>✓✓</Text>
+                  : <Text style={[styles.tickText, { opacity: 0.75 }]}>✓</Text>;
+              return (
+                <TouchableOpacity onPress={() => setMsgInfo(item)} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+                  {tickEl}
+                </TouchableOpacity>
+              );
             })()}
             <Text style={[styles.timestamp, isMyMessage ? styles.myTimestamp : styles.theirTimestamp]}>
               {formatTime(item.timestamp)}
@@ -859,25 +917,13 @@ const ChatScreen = ({ route, navigation }) => {
         </View>
       </TouchableOpacity>
     );
-  };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [messages, styles, colors, deviceId, msgInfo]);
 
-  const formatTime = (timestamp) => {
-    if (!timestamp) return '';
-    try {
-      return new Date(timestamp).toLocaleTimeString([], {
-        hour: '2-digit', minute: '2-digit', hour12: true,
-      }).toLowerCase();
-    } catch (_e) { return ''; }
-  };
 
   // ─── Loading state ────────────────────────────────────────────────────────
   if (isLoading) {
-    return (
-      <SafeAreaView style={styles.loadingContainer}>
-        <ActivityIndicator size="large" color={colors.primary} />
-        <Text style={styles.loadingText}>Loading messages...</Text>
-      </SafeAreaView>
-    );
+    return <LoadingScreen message="Loading messages..." />;
   }
 
   // ─── Main render ──────────────────────────────────────────────────────────
@@ -885,11 +931,7 @@ const ChatScreen = ({ route, navigation }) => {
   const screenH = Dimensions.get('window').height;
 
   return (
-    <KeyboardAvoidingView
-      style={styles.container}
-      behavior="padding"
-      keyboardVerticalOffset={headerHeight}
-    >
+    <View style={[styles.container, { paddingBottom: keyboardHeight }]}>
       {/* Fullscreen photo viewer */}
       <Modal
         visible={!!fullscreenPhoto}
@@ -914,6 +956,71 @@ const ChatScreen = ({ route, navigation }) => {
         </TouchableOpacity>
       </Modal>
 
+      {/* Message delivery info panel */}
+      <Modal
+        visible={!!msgInfo}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setMsgInfo(null)}
+      >
+        <TouchableOpacity
+          style={styles.infoOverlay}
+          activeOpacity={1}
+          onPress={() => setMsgInfo(null)}
+        >
+          <TouchableOpacity activeOpacity={1} style={styles.infoSheet} onPress={() => {}}>
+            <View style={styles.infoHandle} />
+            <Text style={styles.infoTitle}>Message Info</Text>
+
+            {msgInfo && (() => {
+              return (
+                <>
+                  <View style={styles.infoRow}>
+                    <Icon name="send" size={18} color="#4CAF50" />
+                    <View style={styles.infoRowText}>
+                      <Text style={styles.infoLabel}>Sent</Text>
+                      <Text style={styles.infoValue}>{formatDateTime(msgInfo.timestamp)}</Text>
+                    </View>
+                  </View>
+
+                  <View style={styles.infoRow}>
+                    <Icon name="done-all" size={18} color={msgInfo.deliveredAt ? '#9E9E9E' : '#ccc'} />
+                    <View style={styles.infoRowText}>
+                      <Text style={styles.infoLabel}>Delivered</Text>
+                      <Text style={styles.infoValue}>{formatDateTime(msgInfo.deliveredAt) || '—'}</Text>
+                    </View>
+                  </View>
+
+                  <View style={styles.infoRow}>
+                    <Icon name="done-all" size={18} color={msgInfo.readAt ? '#64B5F6' : '#ccc'} />
+                    <View style={styles.infoRowText}>
+                      <Text style={styles.infoLabel}>Read</Text>
+                      <Text style={styles.infoValue}>{formatDateTime(msgInfo.readAt) || '—'}</Text>
+                    </View>
+                  </View>
+
+                  {msgInfo.deliveredAt && msgInfo.timestamp && (
+                    <View style={styles.infoRow}>
+                      <Icon name="timer" size={18} color="#9E9E9E" />
+                      <View style={styles.infoRowText}>
+                        <Text style={styles.infoLabel}>Delivery time</Text>
+                        <Text style={styles.infoValue}>
+                          {formatElapsed(msgInfo.timestamp, msgInfo.deliveredAt)}
+                        </Text>
+                      </View>
+                    </View>
+                  )}
+                </>
+              );
+            })()}
+
+            <TouchableOpacity style={styles.infoCloseBtn} onPress={() => setMsgInfo(null)}>
+              <Text style={styles.infoCloseTxt}>Close</Text>
+            </TouchableOpacity>
+          </TouchableOpacity>
+        </TouchableOpacity>
+      </Modal>
+
       <SafeAreaView style={styles.safeArea} edges={['top']}>
         {/* Offline banner — only for direct chats when peer is not reachable */}
         {!isBroadcast && !isDeviceOnline && (
@@ -934,6 +1041,9 @@ const ChatScreen = ({ route, navigation }) => {
             renderItem={renderMessage}
             keyExtractor={(item) => item.id}
             contentContainerStyle={styles.messagesList}
+            removeClippedSubviews
+            maxToRenderPerBatch={10}
+            windowSize={10}
             onScrollBeginDrag={() => showAttachMenu && setShowAttachMenu(false)}
             onScroll={(e) => {
               const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
@@ -1004,24 +1114,22 @@ const ChatScreen = ({ route, navigation }) => {
         {/* Floating attach menu — vertical panel above + button */}
         {showAttachMenu && (
           <View style={styles.attachPanel} pointerEvents="box-none">
-            {isBroadcast && (
+            {showSosFindMe && (
               <TouchableOpacity style={styles.attachPanelBtn} onPress={() => { setShowAttachMenu(false); sendSOS(); }}>
                 <View style={[styles.attachPanelIcon, { backgroundColor: '#C62828' }]}><Icon name="warning" size={20} color="#fff" /></View>
                 <Text style={styles.attachPanelLabel}>SOS</Text>
               </TouchableOpacity>
             )}
-            {!isBroadcast && (
+            {showSosFindMe && (
               <TouchableOpacity style={styles.attachPanelBtn} onPress={() => { setShowAttachMenu(false); sendFindMe(); }}>
                 <View style={[styles.attachPanelIcon, { backgroundColor: '#6A1B9A' }]}><Icon name="my-location" size={20} color="#fff" /></View>
                 <Text style={styles.attachPanelLabel}>Find Me</Text>
               </TouchableOpacity>
             )}
-            {!isBroadcast && (
-              <TouchableOpacity style={styles.attachPanelBtn} onPress={() => { setShowAttachMenu(false); pickAndSendFile(); }}>
-                <View style={[styles.attachPanelIcon, { backgroundColor: '#E65100' }]}><Icon name="attach-file" size={20} color="#fff" /></View>
-                <Text style={styles.attachPanelLabel}>File</Text>
-              </TouchableOpacity>
-            )}
+            <TouchableOpacity style={styles.attachPanelBtn} onPress={() => { setShowAttachMenu(false); pickAndSendFile(); }}>
+              <View style={[styles.attachPanelIcon, { backgroundColor: '#E65100' }]}><Icon name="attach-file" size={20} color="#fff" /></View>
+              <Text style={styles.attachPanelLabel}>File</Text>
+            </TouchableOpacity>
             <TouchableOpacity style={styles.attachPanelBtn} onPress={() => { setShowAttachMenu(false); shareLocation(); }}>
               <View style={[styles.attachPanelIcon, { backgroundColor: '#2E7D32' }]}><Icon name="place" size={20} color="#fff" /></View>
               <Text style={styles.attachPanelLabel}>Location</Text>
@@ -1034,7 +1142,7 @@ const ChatScreen = ({ route, navigation }) => {
         )}
 
         {/* Input bar */}
-        <View style={[styles.inputContainer, { paddingBottom: Math.max(insets.bottom, 8) }]}>
+        <View style={[styles.inputContainer, { paddingBottom: Math.max(insets.bottom, 14) }]}>
           {/* + toggle */}
           <TouchableOpacity
             style={styles.attachBtn}
@@ -1053,7 +1161,7 @@ const ChatScreen = ({ route, navigation }) => {
             multiline
             maxLength={1000}
             onSubmitEditing={sendMessage}
-            blurOnSubmit={false}
+            submitBehavior="newline"
             editable={!isSending}
           />
 
@@ -1069,7 +1177,7 @@ const ChatScreen = ({ route, navigation }) => {
           </TouchableOpacity>
         </View>
       </SafeAreaView>
-    </KeyboardAvoidingView>
+    </View>
   );
 };
 
@@ -1121,6 +1229,23 @@ const makeStyles = (colors) => StyleSheet.create({
     position: 'absolute', bottom: 40,
     color: 'rgba(255,255,255,0.7)', fontSize: 13,
   },
+
+  // Delivery info panel
+  infoOverlay:  { flex: 1, backgroundColor: 'rgba(0,0,0,0.45)', justifyContent: 'flex-end' },
+  infoSheet: {
+    backgroundColor: colors.surface,
+    borderTopLeftRadius: 20, borderTopRightRadius: 20,
+    padding: 20, paddingBottom: 32,
+    borderWidth: 1, borderColor: colors.border,
+  },
+  infoHandle:  { width: 40, height: 4, borderRadius: 2, backgroundColor: colors.border, alignSelf: 'center', marginBottom: 16 },
+  infoTitle:   { fontSize: 16, fontWeight: '700', color: colors.text, marginBottom: 20 },
+  infoRow:     { flexDirection: 'row', alignItems: 'center', marginBottom: 18, gap: 14 },
+  infoRowText: { flex: 1 },
+  infoLabel:   { fontSize: 12, color: colors.textMuted, marginBottom: 2 },
+  infoValue:   { fontSize: 14, fontWeight: '600', color: colors.text },
+  infoCloseBtn:  { marginTop: 8, alignItems: 'center', paddingVertical: 10 },
+  infoCloseTxt:  { color: colors.primary, fontSize: 15, fontWeight: '600' },
 
   messageText:      { fontSize: 16, lineHeight: 20 },
   myMessageText:    { color: colors.myBubbleText },

@@ -1,5 +1,5 @@
 // src/screens/MediaGalleryScreen.js
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import {
   View,
   Text,
@@ -9,10 +9,10 @@ import {
   StyleSheet,
   Dimensions,
   ActivityIndicator,
-  SafeAreaView,
   Linking,
   Modal,
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 import BridgefyService from '../services/BridgefyService';
 import { useTheme } from '../theme';
@@ -21,6 +21,11 @@ const SCREEN_WIDTH = Dimensions.get('window').width;
 const PHOTO_SIZE   = Math.floor((SCREEN_WIDTH - 4) / 3); // 3-column grid, 2px gaps
 
 const TABS = ['Photos', 'Locations'];
+
+const formatDate = (ts) => {
+  if (!ts) return '';
+  return new Date(ts).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' });
+};
 
 const MediaGalleryScreen = ({ route }) => {
   const { conversationId, conversationName, isBroadcast } = route.params || {};
@@ -32,43 +37,47 @@ const MediaGalleryScreen = ({ route }) => {
   const [locations, setLocations]       = useState([]);
   const [isLoading, setIsLoading]       = useState(true);
   const [fullscreenPhoto, setFullscreenPhoto] = useState(null);
+  const isMountedRef = useRef(true);
 
   useEffect(() => {
     loadMedia();
+    return () => { isMountedRef.current = false; };
   }, []);
 
   const loadMedia = async () => {
     try {
       setIsLoading(true);
       const all = await BridgefyService.getMediaMessages(conversationId, isBroadcast);
+      if (!isMountedRef.current) return;
       setPhotos(all.filter(m => m.contentType === 'photo'));
       setLocations(all.filter(m => m.contentType === 'location'));
     } catch (err) {
       console.error('Media load error:', err);
     } finally {
-      setIsLoading(false);
+      if (isMountedRef.current) setIsLoading(false);
     }
   };
 
-  const openMap = (lat, lng) =>
+  const openMap = useCallback((lat, lng) => {
+    if (!lat || !lng) return;
     Linking.openURL(`https://maps.google.com/?q=${lat},${lng}`).catch(console.error);
+  }, []);
 
-  const formatDate = (ts) => {
-    if (!ts) return '';
-    return new Date(ts).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' });
-  };
+  const renderPhoto = useCallback(({ item }) => {
+    const data = item.mediaData?.data;
+    if (!data) return null;
+    return (
+      <TouchableOpacity onPress={() => setFullscreenPhoto(data)} activeOpacity={0.8}>
+        <Image
+          source={{ uri: `data:image/jpeg;base64,${data}` }}
+          style={styles.photoThumb}
+          resizeMode="cover"
+        />
+      </TouchableOpacity>
+    );
+  }, [styles]);
 
-  const renderPhoto = ({ item }) => (
-    <TouchableOpacity onPress={() => setFullscreenPhoto(item.mediaData?.data)} activeOpacity={0.8}>
-      <Image
-        source={{ uri: `data:image/jpeg;base64,${item.mediaData?.data}` }}
-        style={styles.photoThumb}
-        resizeMode="cover"
-      />
-    </TouchableOpacity>
-  );
-
-  const renderLocation = ({ item }) => {
+  const renderLocation = useCallback(({ item }) => {
     const { lat, lng } = item.mediaData || {};
     return (
       <TouchableOpacity style={styles.locationRow} onPress={() => openMap(lat, lng)}>
@@ -81,10 +90,10 @@ const MediaGalleryScreen = ({ route }) => {
             {item.isMine ? 'You' : item.senderName} · {formatDate(item.timestamp)}
           </Text>
         </View>
-        <Text style={styles.locationArrow}>→</Text>
+        <Icon name="chevron-right" size={20} color={colors.textMuted} style={{ marginLeft: 8 }} />
       </TouchableOpacity>
     );
-  };
+  }, [styles, colors, openMap]);
 
   const isEmpty = activeTab === 'Photos' ? photos.length === 0 : locations.length === 0;
 
@@ -147,7 +156,10 @@ const MediaGalleryScreen = ({ route }) => {
               resizeMode="contain"
             />
           )}
-          <Text style={styles.fullscreenClose}>✕  Tap to close</Text>
+          <View style={styles.fullscreenClose}>
+            <Icon name="close" size={18} color="#fff" />
+            <Text style={styles.fullscreenCloseText}>Tap to close</Text>
+          </View>
         </TouchableOpacity>
       </Modal>
     </SafeAreaView>
@@ -195,8 +207,6 @@ const makeStyles = (colors) => StyleSheet.create({
   locationInfo:     { flex: 1 },
   locationCoords:   { fontSize: 14, fontWeight: '600', color: colors.text },
   locationMeta:     { fontSize: 12, color: colors.textMuted, marginTop: 2 },
-  locationArrow:    { color: colors.textMuted, fontSize: 18, marginLeft: 8 },
-
   fullscreenOverlay: {
     flex: 1, backgroundColor: 'rgba(0,0,0,0.95)',
     justifyContent: 'center', alignItems: 'center',
@@ -204,6 +214,9 @@ const makeStyles = (colors) => StyleSheet.create({
   fullscreenImage: { width: '100%', height: '85%' },
   fullscreenClose: {
     position: 'absolute', bottom: 40,
+    flexDirection: 'row', alignItems: 'center', gap: 6,
+  },
+  fullscreenCloseText: {
     color: 'rgba(255,255,255,0.7)', fontSize: 14,
   },
 });

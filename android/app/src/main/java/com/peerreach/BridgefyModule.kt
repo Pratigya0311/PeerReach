@@ -1,5 +1,6 @@
 package com.peerreach
 
+import android.content.Context
 import android.util.Log
 import com.facebook.react.bridge.*
 import com.facebook.react.modules.core.DeviceEventManagerModule
@@ -203,8 +204,12 @@ class BridgefyModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
 
         override fun onDestroySession() {}
         override fun onFailToDestroySession(error: BridgefyException) {}
-        override fun onEstablishSecureConnection(userId: UUID) {}
-        override fun onFailToEstablishSecureConnection(userId: UUID, error: BridgefyException) {}
+        override fun onEstablishSecureConnection(userId: UUID) {
+            Log.i("BridgefyModule", "Secure connection established with: $userId")
+        }
+        override fun onFailToEstablishSecureConnection(userId: UUID, error: BridgefyException) {
+            Log.e("BridgefyModule", "Secure connection FAILED with $userId: ${error.message}")
+        }
     }
 
     private fun sendDeviceListUpdate() {
@@ -260,8 +265,22 @@ class BridgefyModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
                 bridgefyDelegate    // Arg 2: Delegate
             )
 
-            // ✅ 3. Start the service
-            bridgefy?.start(null, PropagationProfile.Standard)
+            // ✅ 3. Start the service with a stable, persisted UUID so the SDK
+            //    reuses the same cryptographic identity across restarts.
+            //    Passing null generates a new random UUID every time, which
+            //    forces a fresh key exchange on every connection and causes
+            //    the connect → immediately-disconnect → never-reconnects loop.
+            val prefs = reactApplicationContext.getSharedPreferences("BridgefyPrefs", Context.MODE_PRIVATE)
+            val storedId = prefs.getString("userId", null)
+            val userId: UUID = if (storedId != null) {
+                UUID.fromString(storedId)
+            } else {
+                val newId = UUID.randomUUID()
+                prefs.edit().putString("userId", newId.toString()).apply()
+                newId
+            }
+            Log.i("BridgefyModule", "Starting with stable userId: $userId")
+            bridgefy?.start(userId, PropagationProfile.Standard)
 
         } catch (e: IllegalArgumentException) {
             Log.e("BridgefyModule", "Invalid API key format", e)
