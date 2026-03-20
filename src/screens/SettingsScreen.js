@@ -8,6 +8,7 @@ import {
   ScrollView,
   Alert,
   ActivityIndicator,
+  Switch,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -28,7 +29,7 @@ const SettingsScreen = () => {
   const styles = useMemo(() => makeStyles(colors), [colors]);
 
   const [displayName, setDisplayName] = useState('');
-  const [saving, setSaving] = useState(false);
+  const [saving, setSaving]           = useState(false);
 
   useEffect(() => {
     setDisplayName(BridgefyService.getDisplayName() || '');
@@ -157,6 +158,8 @@ const makeStyles = (colors) => StyleSheet.create({
 
   resetBtn:     { marginTop: 10, alignItems: 'center', paddingVertical: 8 },
   resetBtnText: { color: colors.error, fontSize: 13, fontWeight: '500' },
+
+  switchRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
 
   optionRow: { flexDirection: 'row', gap: 8 },
   optionBtn: {

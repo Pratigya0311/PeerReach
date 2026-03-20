@@ -30,6 +30,13 @@ import { useTheme } from '../theme';
 // Max base64 length (~45 KB raw image → ~60 KB base64) to stay within Bridgefy's 64 KB limit
 const MAX_BASE64_LENGTH = 61440;
 
+// Max base64 for file transfers (~30 KB raw)
+const MAX_FILE_BASE64 = 40960;
+
+// Conditionally import document picker (install: npm install react-native-document-picker)
+let DocumentPicker = null;
+try { DocumentPicker = require('react-native-document-picker').default; } catch (_e) { /* not installed */ }
+
 // Module-level so it isn't recreated on every render
 const URL_REGEX = /https?:\/\/[^\s]+/gi;
 
@@ -50,6 +57,7 @@ const ChatScreen = ({ route, navigation }) => {
   const [typingUser, setTypingUser]         = useState(null);   // senderName string
   const [showScrollBtn, setShowScrollBtn]   = useState(false);
   const [isDeviceOnline, setIsDeviceOnline] = useState(true);
+  const [showAttachMenu, setShowAttachMenu] = useState(false);
 
   const flatListRef      = useRef(null);
   const isMountedRef     = useRef(true);
@@ -92,24 +100,33 @@ const ChatScreen = ({ route, navigation }) => {
     BridgefyService.setMessageListener(handleNewMessage);
     BridgefyService.setOnTypingHandler(handleTyping);
     BridgefyService.markAsRead(deviceId, isBroadcast);
+    BridgefyService.setOnMessageStatusUpdatedHandler(({ messageId, status }) => {
+      if (!isMountedRef.current) return;
+      setMessages(prev => prev.map(m => m.id === messageId ? { ...m, deliveryStatus: status } : m));
+    });
 
-    // Track whether the target device is reachable
-    const checkOnline = () => {
-      if (!isBroadcast && deviceId) {
-        BridgefyService.getConnectedDevices().then(list => {
-          if (isMountedRef.current)
-            setIsDeviceOnline(list.some(d => d.id === deviceId));
-        }).catch(() => {});
+    // Track whether the target device is reachable (event-driven, no polling)
+    if (!isBroadcast && deviceId) {
+      BridgefyService.getConnectedDevices().then(list => {
+        if (isMountedRef.current) setIsDeviceOnline(list.some(d => d.id === deviceId));
+      }).catch(() => {});
+    }
+    BridgefyService.setDeviceListListener((data) => {
+      if (!isMountedRef.current || isBroadcast) return;
+      const devices = data?.devices || [];
+      setIsDeviceOnline(devices.some(d => d.id === deviceId));
+      // If this device announced an updated display name, refresh the header
+      if (data?.deviceId === deviceId && data?.name) {
+        navigation.setOptions({ title: data.name });
       }
-    };
-    checkOnline();
-    const onlineTimer = setInterval(checkOnline, 5000);
+    });
 
     return () => {
       isMountedRef.current = false;
       BridgefyService.setMessageListener(null);
       BridgefyService.setOnTypingHandler(null);
-      clearInterval(onlineTimer);
+      BridgefyService.setDeviceListListener(null);
+      BridgefyService.setOnMessageStatusUpdatedHandler(null);
       if (typingTimerRef.current) clearTimeout(typingTimerRef.current);
     };
   }, [deviceId, deviceName, isBroadcast, navigation]);
@@ -118,6 +135,7 @@ const ChatScreen = ({ route, navigation }) => {
     try {
       setIsLoading(true);
       const stored = await BridgefyService.getMessages(deviceId, isBroadcast, 200);
+      if (!isMountedRef.current) return;
       if (stored.length === 0 && !isBroadcast) {
         setMessages([{
           id: `welcome_${Date.now()}`,
@@ -137,6 +155,7 @@ const ChatScreen = ({ route, navigation }) => {
           flatListRef.current.scrollToEnd({ animated: false });
       }, 100);
     } catch (error) {
+      if (!isMountedRef.current) return;
       console.error('Error loading messages:', error);
       setIsLoading(false);
     }
@@ -287,6 +306,145 @@ const ChatScreen = ({ route, navigation }) => {
       Alert.alert('Send failed', error.message || 'Unknown error');
     } finally {
       setIsSending(false);
+    }
+  };
+
+  // ─── Send file ────────────────────────────────────────────────────────────
+  const pickAndSendFile = async () => {
+    if (isSending) return;
+    if (!DocumentPicker) {
+      Alert.alert(
+        'File sharing unavailable',
+        'The document picker package is not compatible with this React Native version yet.'
+      );
+      return;
+    }
+    try {
+      const result = await DocumentPicker.pickSingle({ type: [DocumentPicker.types.allFiles] });
+      const { uri, name: fileName, size: fileSize, type: mimeType } = result;
+      // Read file as base64 via XHR
+      const base64 = await new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.onload = () => {
+          const reader = new FileReader();
+          reader.onloadend = () => resolve(reader.result.split(',')[1]);
+          reader.onerror  = reject;
+          reader.readAsDataURL(xhr.response);
+        };
+        xhr.onerror = reject;
+        xhr.open('GET', uri);
+        xhr.responseType = 'blob';
+        xhr.send();
+      });
+      if (base64.length > MAX_FILE_BASE64) {
+        Alert.alert('File too large', `Max ~30 KB. This file is ~${Math.round(base64.length * 0.75 / 1024)} KB.`);
+        return;
+      }
+      setIsSending(true);
+      const sent = await BridgefyService.sendFile(deviceId, fileName, mimeType, base64, fileSize);
+      addMessage(sent);
+    } catch (err) {
+      if (DocumentPicker.isCancel(err)) return; // user cancelled
+      Alert.alert('File send failed', err.message || 'Unknown error');
+    } finally {
+      setIsSending(false);
+    }
+  };
+
+  // ─── Send SOS (broadcast only) ────────────────────────────────────────────
+  const sendSOS = () => {
+    Alert.alert(
+      '🚨 Send SOS',
+      'This will broadcast an emergency alert with your location to all nearby devices.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Send SOS',
+          style: 'destructive',
+          onPress: async () => {
+            if (isSending) return;
+            try {
+              if (Platform.OS === 'android') {
+                const granted = await PermissionsAndroid.request(
+                  PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION
+                );
+                if (granted !== PermissionsAndroid.RESULTS.GRANTED) {
+                  Alert.alert('Permission denied', 'Location is required for SOS.');
+                  return;
+                }
+              }
+              setIsSending(true);
+              Geolocation.getCurrentPosition(
+                async (pos) => {
+                  if (!isMountedRef.current) return;
+                  try {
+                    const { latitude: lat, longitude: lng } = pos.coords;
+                    const sent = await BridgefyService.sendSOS(lat, lng);
+                    if (isMountedRef.current) addMessage(sent);
+                  } catch (e) {
+                    if (isMountedRef.current) Alert.alert('SOS failed', e.message);
+                  } finally {
+                    if (isMountedRef.current) setIsSending(false);
+                  }
+                },
+                (err) => {
+                  if (!isMountedRef.current) return;
+                  setIsSending(false);
+                  Alert.alert('Location error', err.message);
+                },
+                { enableHighAccuracy: true, timeout: 10000, maximumAge: 5000 }
+              );
+            } catch (err) {
+              if (isMountedRef.current) {
+                setIsSending(false);
+                Alert.alert('SOS failed', err.message);
+              }
+            }
+          },
+        },
+      ]
+    );
+  };
+
+  // ─── Send Find Me request (direct chat only) ──────────────────────────────
+  const sendFindMe = async () => {
+    if (isSending) return;
+    try {
+      if (Platform.OS === 'android') {
+        const granted = await PermissionsAndroid.request(
+          PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION
+        );
+        if (granted !== PermissionsAndroid.RESULTS.GRANTED) {
+          Alert.alert('Permission denied', 'Location is required to share your position.');
+          return;
+        }
+      }
+      setIsSending(true);
+      Geolocation.getCurrentPosition(
+        async (pos) => {
+          if (!isMountedRef.current) return;
+          try {
+            const { latitude: lat, longitude: lng } = pos.coords;
+            const sent = await BridgefyService.sendFindMeRequest(deviceId, lat, lng, isBroadcast);
+            if (isMountedRef.current) addMessage(sent);
+          } catch (e) {
+            if (isMountedRef.current) Alert.alert('Find Me failed', e.message);
+          } finally {
+            if (isMountedRef.current) setIsSending(false);
+          }
+        },
+        (err) => {
+          if (!isMountedRef.current) return;
+          setIsSending(false);
+          Alert.alert('Location error', err.message);
+        },
+        { enableHighAccuracy: true, timeout: 10000, maximumAge: 5000 }
+      );
+    } catch (err) {
+      if (isMountedRef.current) {
+        setIsSending(false);
+        Alert.alert('Find Me failed', err.message);
+      }
     }
   };
 
@@ -475,6 +633,137 @@ const ChatScreen = ({ route, navigation }) => {
       );
     }
 
+    // ─── SOS ──────────────────────────────────────────────────────────────────
+    if (item.contentType === 'sos' && item.mediaData) {
+      const { lat, lng, senderName } = item.mediaData;
+      return (
+        <View style={styles.sosCard}>
+          <View style={styles.sosHeader}>
+            <Icon name="warning" size={20} color="#fff" />
+            <Text style={styles.sosTitle}> SOS — Emergency</Text>
+          </View>
+          {!isMyMessage && (
+            <Text style={styles.sosSender}>{senderName} needs help</Text>
+          )}
+          {lat != null && (
+            <TouchableOpacity onPress={() => openMap(lat, lng)} style={styles.sosMapBtn}>
+              <Icon name="place" size={14} color="#fff" />
+              <Text style={styles.sosMapText}>
+                {lat.toFixed(5)}, {lng.toFixed(5)} — Tap for map
+              </Text>
+            </TouchableOpacity>
+          )}
+          {!isMyMessage && lat != null && (
+            <TouchableOpacity
+              style={styles.sosFindBtn}
+              onPress={() => navigation.navigate('FindDevice', {
+                targetDeviceId: item.senderId,
+                targetDeviceName: senderName || item.senderName,
+                targetLat: lat,
+                targetLng: lng,
+                requestId: `sos_${item.id}`,
+              })}
+            >
+              <Icon name="navigation" size={14} color="#fff" />
+              <Text style={styles.sosFindText}> Navigate to them</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+      );
+    }
+
+    // ─── File ─────────────────────────────────────────────────────────────────
+    if (item.contentType === 'file' && item.mediaData) {
+      const { fileName, fileSize, mimeType, base64 } = item.mediaData;
+      const sizeLabel = fileSize ? ` · ${Math.round(fileSize / 1024)} KB` : '';
+      const handleOpenFile = () => {
+        if (base64 && mimeType) {
+          Share.share({ message: `${fileName || 'file'}\n\ndata:${mimeType};base64,${base64}` }).catch(() => {});
+        } else {
+          Alert.alert('Cannot open', 'File data is unavailable.');
+        }
+      };
+      return (
+        <TouchableOpacity style={styles.fileCard} onPress={handleOpenFile} activeOpacity={0.75}>
+          <Icon name="insert-drive-file" size={28} color={isMyMessage ? 'rgba(255,255,255,0.85)' : colors.primary} />
+          <View style={styles.fileInfo}>
+            <Text style={[styles.fileName, isMyMessage && styles.fileNameMine]} numberOfLines={1}>
+              {fileName || 'File'}
+            </Text>
+            <Text style={[styles.fileMeta, isMyMessage && styles.fileMetaMine]}>
+              {mimeType || 'file'}{sizeLabel}
+            </Text>
+          </View>
+          <Icon name="share" size={18} color={isMyMessage ? 'rgba(255,255,255,0.7)' : colors.textSecondary} />
+        </TouchableOpacity>
+      );
+    }
+
+    // ─── Find Me Request ──────────────────────────────────────────────────────
+    if (item.contentType === 'find_me_request' && item.mediaData) {
+      const { lat, lng, requestId: rid, senderName } = item.mediaData;
+      if (isMyMessage) {
+        return (
+          <View style={styles.findMeCard}>
+            <Icon name="my-location" size={18} color={colors.primary} />
+            <Text style={styles.findMeText}> You shared your location — waiting for them to find you</Text>
+          </View>
+        );
+      }
+      return (
+        <View style={styles.findMeCard}>
+          <Icon name="location-on" size={18} color={colors.primary} />
+          <Text style={styles.findMeText}> {senderName || item.senderName} wants you to find them</Text>
+          <TouchableOpacity
+            style={styles.findMeBtn}
+            onPress={() => navigation.navigate('FindDevice', {
+              targetDeviceId: item.senderId,
+              targetDeviceName: senderName || item.senderName,
+              targetLat: lat,
+              targetLng: lng,
+              requestId: rid,
+              wasBroadcast: isBroadcast || !item.mediaData?.targetDeviceId,
+            })}
+          >
+            <Icon name="navigation" size={14} color="#fff" />
+            <Text style={styles.findMeBtnText}> Open Compass</Text>
+          </TouchableOpacity>
+        </View>
+      );
+    }
+
+    // ─── Find Me Response ─────────────────────────────────────────────────────
+    if (item.contentType === 'find_me_response' && item.mediaData) {
+      const { lat, lng, requestId: rid, senderName } = item.mediaData;
+      if (isMyMessage) {
+        return (
+          <View style={styles.findMeCard}>
+            <Icon name="share-location" size={18} color={colors.primary} />
+            <Text style={styles.findMeText}> You shared your location back</Text>
+          </View>
+        );
+      }
+      return (
+        <View style={styles.findMeCard}>
+          <Icon name="share-location" size={18} color={colors.primary} />
+          <Text style={styles.findMeText}> {senderName || item.senderName} shared their location</Text>
+          <TouchableOpacity
+            style={styles.findMeBtn}
+            onPress={() => navigation.navigate('FindDevice', {
+              targetDeviceId: item.senderId,
+              targetDeviceName: senderName || item.senderName,
+              targetLat: lat,
+              targetLng: lng,
+              requestId: rid,
+            })}
+          >
+            <Icon name="navigation" size={14} color="#fff" />
+            <Text style={styles.findMeBtnText}> Open Compass</Text>
+          </TouchableOpacity>
+        </View>
+      );
+    }
+
     return renderTextWithLinks(item.text, isMyMessage);
   };
 
@@ -553,11 +842,16 @@ const ChatScreen = ({ route, navigation }) => {
           {renderReplyQuote(item)}
           {renderContent(item)}
           <View style={styles.messageFooter}>
-            {isMyMessage && (
-              <Text style={[styles.messageStatus, styles.messageStatusMine]}>
-                {isSending ? '\u00B7\u00B7\u00B7' : '\u2713'}
-              </Text>
-            )}
+            {isMyMessage && (() => {
+              const ds = item.deliveryStatus;
+              if (isSending || ds === 'sending')
+                return <Text style={[styles.tickText, { opacity: 0.5 }]}>···</Text>;
+              if (ds === 'read')
+                return <Text style={[styles.tickText, { color: '#64B5F6' }]}>✓✓</Text>;
+              if (ds === 'delivered')
+                return <Text style={[styles.tickText, { opacity: 0.75 }]}>✓✓</Text>;
+              return <Text style={[styles.tickText, { opacity: 0.75 }]}>✓</Text>;
+            })()}
             <Text style={[styles.timestamp, isMyMessage ? styles.myTimestamp : styles.theirTimestamp]}>
               {formatTime(item.timestamp)}
             </Text>
@@ -640,6 +934,7 @@ const ChatScreen = ({ route, navigation }) => {
             renderItem={renderMessage}
             keyExtractor={(item) => item.id}
             contentContainerStyle={styles.messagesList}
+            onScrollBeginDrag={() => showAttachMenu && setShowAttachMenu(false)}
             onScroll={(e) => {
               const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
               const distFromBottom = contentSize.height - contentOffset.y - layoutMeasurement.height;
@@ -706,22 +1001,47 @@ const ChatScreen = ({ route, navigation }) => {
           </View>
         )}
 
+        {/* Floating attach menu — vertical panel above + button */}
+        {showAttachMenu && (
+          <View style={styles.attachPanel} pointerEvents="box-none">
+            {isBroadcast && (
+              <TouchableOpacity style={styles.attachPanelBtn} onPress={() => { setShowAttachMenu(false); sendSOS(); }}>
+                <View style={[styles.attachPanelIcon, { backgroundColor: '#C62828' }]}><Icon name="warning" size={20} color="#fff" /></View>
+                <Text style={styles.attachPanelLabel}>SOS</Text>
+              </TouchableOpacity>
+            )}
+            {!isBroadcast && (
+              <TouchableOpacity style={styles.attachPanelBtn} onPress={() => { setShowAttachMenu(false); sendFindMe(); }}>
+                <View style={[styles.attachPanelIcon, { backgroundColor: '#6A1B9A' }]}><Icon name="my-location" size={20} color="#fff" /></View>
+                <Text style={styles.attachPanelLabel}>Find Me</Text>
+              </TouchableOpacity>
+            )}
+            {!isBroadcast && (
+              <TouchableOpacity style={styles.attachPanelBtn} onPress={() => { setShowAttachMenu(false); pickAndSendFile(); }}>
+                <View style={[styles.attachPanelIcon, { backgroundColor: '#E65100' }]}><Icon name="attach-file" size={20} color="#fff" /></View>
+                <Text style={styles.attachPanelLabel}>File</Text>
+              </TouchableOpacity>
+            )}
+            <TouchableOpacity style={styles.attachPanelBtn} onPress={() => { setShowAttachMenu(false); shareLocation(); }}>
+              <View style={[styles.attachPanelIcon, { backgroundColor: '#2E7D32' }]}><Icon name="place" size={20} color="#fff" /></View>
+              <Text style={styles.attachPanelLabel}>Location</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.attachPanelBtn} onPress={() => { setShowAttachMenu(false); pickAndSendPhoto(); }}>
+              <View style={[styles.attachPanelIcon, { backgroundColor: '#1565C0' }]}><Icon name="image" size={20} color="#fff" /></View>
+              <Text style={styles.attachPanelLabel}>Photo</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+
         {/* Input bar */}
         <View style={[styles.inputContainer, { paddingBottom: Math.max(insets.bottom, 8) }]}>
+          {/* + toggle */}
           <TouchableOpacity
             style={styles.attachBtn}
-            onPress={pickAndSendPhoto}
+            onPress={() => setShowAttachMenu(prev => !prev)}
             disabled={isSending}
           >
-            <Icon name="image" size={22} color={isSending ? colors.border : colors.primary} />
-          </TouchableOpacity>
-
-          <TouchableOpacity
-            style={styles.attachBtn}
-            onPress={shareLocation}
-            disabled={isSending}
-          >
-            <Icon name="place" size={22} color={isSending ? colors.border : colors.primary} />
+            <Icon name={showAttachMenu ? 'close' : 'add'} size={24} color={isSending ? colors.border : colors.primary} />
           </TouchableOpacity>
 
           <TextInput
@@ -812,6 +1132,7 @@ const makeStyles = (colors) => StyleSheet.create({
   },
   messageStatus:     { fontSize: 12, marginRight: 4, opacity: 0.7 },
   messageStatusMine: { color: colors.onBubble },
+  tickText:          { fontSize: 12, marginRight: 4, color: '#FFFFFF', fontWeight: '600' },
   timestamp:         { fontSize: 11, opacity: 0.7 },
   myTimestamp:       { color: colors.onBubble },
   theirTimestamp:    { color: colors.textMuted },
@@ -854,6 +1175,36 @@ const makeStyles = (colors) => StyleSheet.create({
     alignItems: 'flex-end',
   },
   attachBtn: { width: 36, height: 40, justifyContent: 'center', alignItems: 'center', marginRight: 2 },
+
+  attachPanel: {
+    position: 'absolute',
+    bottom: 64,
+    left: 8,
+    backgroundColor: colors.surface,
+    borderRadius: 16,
+    paddingVertical: 8,
+    paddingHorizontal: 4,
+    elevation: 8,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: -2 },
+    shadowOpacity: 0.15,
+    shadowRadius: 8,
+    zIndex: 100,
+  },
+  attachPanelBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    gap: 12,
+  },
+  attachPanelIcon: {
+    width: 40, height: 40, borderRadius: 20,
+    justifyContent: 'center', alignItems: 'center',
+  },
+  attachPanelLabel: {
+    fontSize: 14, fontWeight: '500', color: colors.text,
+  },
   input: {
     flex: 1,
     backgroundColor: colors.surfaceVariant,
@@ -913,6 +1264,45 @@ const makeStyles = (colors) => StyleSheet.create({
   },
   typingText: { fontSize: 13, color: colors.textSecondary },
   typingDots: { fontSize: 13, color: colors.primary, letterSpacing: 2 },
+
+  // ── SOS bubble ────────────────────────────────────────────────────────────
+  sosCard: {
+    backgroundColor: '#C62828', borderRadius: 10, padding: 12, minWidth: 200,
+  },
+  sosHeader:  { flexDirection: 'row', alignItems: 'center', marginBottom: 6 },
+  sosTitle:   { color: '#fff', fontWeight: '800', fontSize: 15 },
+  sosSender:  { color: 'rgba(255,255,255,0.85)', fontSize: 13, marginBottom: 6 },
+  sosMapBtn:  { flexDirection: 'row', alignItems: 'center', marginBottom: 8 },
+  sosMapText: { color: 'rgba(255,255,255,0.8)', fontSize: 11, marginLeft: 2 },
+  sosFindBtn: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
+    backgroundColor: 'rgba(255,255,255,0.2)', borderRadius: 8,
+    paddingVertical: 8, paddingHorizontal: 12,
+  },
+  sosFindText: { color: '#fff', fontWeight: '700', fontSize: 13 },
+  sosBtnInput: { /* tint handled by icon color */ },
+
+  // ── File bubble ───────────────────────────────────────────────────────────
+  fileCard: {
+    flexDirection: 'row', alignItems: 'center', minWidth: 160, paddingVertical: 4,
+  },
+  fileInfo:    { flex: 1, marginLeft: 10 },
+  fileName:    { fontSize: 14, fontWeight: '600', color: colors.theirBubbleText },
+  fileNameMine: { color: colors.onBubble },
+  fileMeta:    { fontSize: 11, color: colors.textMuted, marginTop: 2 },
+  fileMetaMine: { color: 'rgba(255,255,255,0.7)' },
+
+  // ── Find Me bubble ────────────────────────────────────────────────────────
+  findMeCard: {
+    minWidth: 180, paddingVertical: 4,
+  },
+  findMeText: { fontSize: 13, color: colors.theirBubbleText, marginTop: 4, marginBottom: 8, lineHeight: 18 },
+  findMeBtn:  {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
+    backgroundColor: colors.primary, borderRadius: 8,
+    paddingVertical: 8, paddingHorizontal: 12,
+  },
+  findMeBtnText: { color: '#fff', fontWeight: '700', fontSize: 13 },
 
   // ── Offline banner ────────────────────────────────────────────────────────
   offlineBanner: {

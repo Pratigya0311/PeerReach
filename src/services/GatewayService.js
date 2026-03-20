@@ -2,9 +2,9 @@
 // Crowdsourced Opportunistic Internet Gateway over BLE Mesh
 import databaseService from './DatabaseService';
 
-// ── xAI Grok API key ─────────────────────────────────────────────────────────
-// Get your key from https://console.x.ai/ and replace the placeholder below.
-const API_KEY = process.env.GROQ_API_KEY;
+// ── Groq API key ──────────────────────────────────────────────────────────────
+// Get your key from https://console.groq.com/ and replace the placeholder below.
+const GROQ_API_KEY = '';
 
 // Android's own connectivity check endpoint — always returns exactly 204, never redirects to captive portal pages
 const CONNECTIVITY_URLS = [
@@ -195,17 +195,17 @@ class GatewayService {
     }
   }
 
-  async _fetchGrok(query) {
-    console.log('[Grok] Starting request for query:', query);
+  async _fetchGroq(query) {
+    console.log('[Groq] Starting request for query:', query);
 
-    if (!GROK_API_KEY || GROK_API_KEY === 'YOUR_XAI_API_KEY_HERE') {
-      console.error('[Grok] ❌ API key is missing or not configured');
-      throw new Error('Grok API key not configured');
+    if (!GROQ_API_KEY || GROQ_API_KEY === 'YOUR_GROQ_API_KEY_HERE') {
+      console.error('[Groq] ❌ API key is missing or not configured');
+      throw new Error('Groq API key not configured');
     }
-    console.log('[Grok] API key present, length:', GROK_API_KEY.length, 'prefix:', GROK_API_KEY.substring(0, 6));
+    console.log('[Groq] API key present, length:', GROQ_API_KEY.length, 'prefix:', GROQ_API_KEY.substring(0, 6));
 
     const requestBody = {
-      model: 'grok-3-mini',
+      model: 'llama-3.3-70b-versatile',
       messages: [
         {
           role: 'system',
@@ -215,50 +215,55 @@ class GatewayService {
       ],
       max_tokens: 250,
     };
-    console.log('[Grok] Sending to https://api.x.ai/v1/chat/completions, model:', requestBody.model);
+    console.log('[Groq] Sending to https://api.groq.com/openai/v1/chat/completions, model:', requestBody.model);
 
     let res;
     try {
-      res = await fetch('https://api.x.ai/v1/chat/completions', {
+      res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
         method: 'POST',
-        signal: this._makeSignal(15000),
+        signal: this._makeSignal(25000),
         headers: {
-          Authorization: `Bearer ${GROK_API_KEY}`,
+          Authorization: `Bearer ${GROQ_API_KEY}`,
           'Content-Type': 'application/json',
           'User-Agent': this._headers['User-Agent'],
         },
         body: JSON.stringify(requestBody),
       });
     } catch (fetchErr) {
-      console.error('[Grok] ❌ Network/fetch error:', fetchErr.message);
+      // AbortError = timeout — fall through to Wikipedia silently
+      if (fetchErr.name === 'AbortError') {
+        console.warn('[Groq] ⏱ Request timed out, falling back to Wikipedia');
+      } else {
+        console.warn('[Groq] ⚠️ Network error:', fetchErr.message);
+      }
       throw fetchErr;
     }
 
-    console.log('[Grok] HTTP status:', res.status, res.statusText);
+    console.log('[Groq] HTTP status:', res.status, res.statusText);
 
     if (!res.ok) {
       const errBody = await res.text().catch(() => '(could not read body)');
-      console.error('[Grok] ❌ Non-OK response. Status:', res.status, '| Body:', errBody.substring(0, 300));
-      throw new Error(`Grok ${res.status}: ${errBody.substring(0, 80)}`);
+      console.error('[Groq] ❌ Non-OK response. Status:', res.status, '| Body:', errBody.substring(0, 300));
+      throw new Error(`Groq ${res.status}: ${errBody.substring(0, 80)}`);
     }
 
     let json;
     try {
       json = await res.json();
     } catch (parseErr) {
-      console.error('[Grok] ❌ Failed to parse JSON response:', parseErr.message);
+      console.error('[Groq] ❌ Failed to parse JSON response:', parseErr.message);
       throw parseErr;
     }
 
-    console.log('[Grok] Response structure — choices:', json?.choices?.length, '| finish_reason:', json?.choices?.[0]?.finish_reason);
+    console.log('[Groq] Response structure — choices:', json?.choices?.length, '| finish_reason:', json?.choices?.[0]?.finish_reason);
 
     const content = json?.choices?.[0]?.message?.content?.trim();
     if (!content || content.length < 5) {
-      console.error('[Grok] ❌ Empty or too-short content. Full response:', JSON.stringify(json).substring(0, 300));
-      throw new Error('Empty Grok response');
+      console.error('[Groq] ❌ Empty or too-short content. Full response:', JSON.stringify(json).substring(0, 300));
+      throw new Error('Empty Groq response');
     }
 
-    console.log('[Grok] ✅ Got answer, length:', content.length);
+    console.log('[Groq] ✅ Got answer, length:', content.length);
     return content.length > 800 ? content.substring(0, 797) + '...' : content;
   }
 
@@ -341,19 +346,19 @@ class GatewayService {
       }
     }
 
-    // General queries: Grok → Wikipedia → DuckDuckGo (in priority order)
+    // General queries: Groq → Wikipedia → DuckDuckGo (in priority order)
     if (!result) {
-      console.log('[Gateway] Trying Grok...');
+      console.log('[Gateway] Trying Groq...');
       try {
-        result = await this._fetchGrok(query);
-        console.log('[Gateway] 🤖 Grok answer obtained');
-      } catch (grokErr) {
-        console.warn('[Gateway] ⚠️ Grok unavailable:', grokErr.message);
+        result = await this._fetchGroq(query);
+        console.log('[Gateway] 🤖 Groq answer obtained');
+      } catch (groqErr) {
+        console.warn('[Gateway] ⚠️ Groq unavailable:', groqErr.message);
       }
     }
 
     if (!result) {
-      console.log('[Gateway] Grok failed or skipped — trying Wikipedia...');
+      console.log('[Gateway] Groq failed or skipped — trying Wikipedia...');
       try {
         result = await this._fetchWikipedia(query);
         console.log('[Gateway] 📖 Wikipedia answer obtained');
@@ -657,6 +662,18 @@ class GatewayService {
       return items;
     } catch (_e) {
       return [];
+    }
+  }
+
+  // ── Local weather widget ────────────────────────────────────────────────────
+  // Returns a compact string like "Bangalore: ⛅  +28°C" or null on failure.
+  // Uses IP-based location — no GPS or user input needed.
+  async getLocalWeather() {
+    try {
+      const text = await this._fetchWeather(null); // null → auto IP location
+      return text || null;
+    } catch (_e) {
+      return null;
     }
   }
 

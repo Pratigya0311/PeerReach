@@ -11,6 +11,7 @@ import MeshQueryScreen from '../screens/MeshQueryScreen';
 import MediaGalleryScreen from '../screens/MediaGalleryScreen';
 import LogsScreen from '../screens/LogsScreen';
 import SettingsScreen from '../screens/SettingsScreen';
+import FindDeviceScreen from '../screens/FindDeviceScreen';
 
 const Stack = createStackNavigator();
 
@@ -49,7 +50,12 @@ const AppNavigator = () => {
         initialRouteName="Home"
         screenOptions={({ navigation }) => ({
           headerTintColor: '#FFFFFF',
-          headerTitleStyle: { fontWeight: 'bold' },
+          headerTitleStyle: { fontWeight: 'bold', color: '#FFFFFF' },
+          headerStyle: {
+            backgroundColor: isDark ? '#1C1C1E' : '#007AFF',
+            elevation: 0,
+            shadowOpacity: 0,
+          },
           headerBackTitle: 'Back',
           headerRight: () => (
             <TouchableOpacity
@@ -95,6 +101,11 @@ const AppNavigator = () => {
           name="Settings"
           component={SettingsScreen}
           options={{ title: 'Settings', headerRight: () => null }}
+        />
+        <Stack.Screen
+          name="FindDevice"
+          component={FindDeviceScreen}
+          options={{ headerShown: false }}
         />
       </Stack.Navigator>
     </NavigationContainer>

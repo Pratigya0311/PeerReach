@@ -113,7 +113,7 @@ class DatabaseService {
         );
       `);
 
-      // 5. Migrate: add is_pinned, reply columns (safe — no-op if already exists)
+      // 5. Migrate: add is_pinned, reply, battery columns (safe — no-op if already exists)
       try {
         await this.db.executeSql('ALTER TABLE messages ADD COLUMN is_pinned INTEGER DEFAULT 0;');
       } catch (_e) { /* column already exists */ }
@@ -122,6 +122,9 @@ class DatabaseService {
       } catch (_e) { /* column already exists */ }
       try {
         await this.db.executeSql('ALTER TABLE messages ADD COLUMN reply_preview TEXT;');
+      } catch (_e) { /* column already exists */ }
+      try {
+        await this.db.executeSql('ALTER TABLE devices ADD COLUMN battery INTEGER;');
       } catch (_e) { /* column already exists */ }
 
       // 6. Create indexes for performance
@@ -160,14 +163,14 @@ class DatabaseService {
   async saveDevice(device) {
     try {
       await this.ensureInitialized();
-      const { id, name, last_seen = Date.now(), connection_status = 'online' } = device;
-      
+      const { id, name, last_seen = Date.now(), connection_status = 'online', battery = null } = device;
+
       await this.db.executeSql(
-        `INSERT OR REPLACE INTO devices (id, name, last_seen, connection_status, updated_at) 
-         VALUES (?, ?, ?, ?, strftime('%s', 'now'));`,
-        [id, name, last_seen, connection_status]
+        `INSERT OR REPLACE INTO devices (id, name, last_seen, connection_status, battery, updated_at)
+         VALUES (?, ?, ?, ?, ?, strftime('%s', 'now'));`,
+        [id, name, last_seen, connection_status, battery]
       );
-      
+
       return device;
     } catch (error) {
       console.error('❌ Error saving device:', error);
@@ -176,6 +179,7 @@ class DatabaseService {
   }
 
   async getDevice(deviceId) {
+    if (!deviceId) return null;
     try {
       await this.ensureInitialized();
       const [results] = await this.db.executeSql(
@@ -260,6 +264,18 @@ class DatabaseService {
     } catch (error) {
       console.error('❌ Error saving message:', error);
       throw error;
+    }
+  }
+
+  async updateMessageStatus(messageId, status) {
+    try {
+      await this.ensureInitialized();
+      await this.db.executeSql(
+        'UPDATE messages SET delivery_status = ? WHERE id = ?',
+        [status, messageId]
+      );
+    } catch (err) {
+      console.warn('updateMessageStatus error:', err);
     }
   }
 
@@ -447,8 +463,16 @@ class DatabaseService {
           const parsed = JSON.parse(preview);
           if (parsed.type === 'photo') preview = '[Photo]';
           else if (parsed.type === 'location') preview = '[Location]';
+          else if (parsed.type === 'sos') preview = '🚨 SOS — Emergency';
+          else if (parsed.type === 'file') preview = `[File] ${parsed.fileName || 'attachment'}`;
+          else if (parsed.type === 'find_me_request') preview = '📍 Find Me request';
+          else if (parsed.type === 'find_me_response') preview = '📍 Location shared';
           else preview = parsed.text || preview;
         } catch (_e) { /* keep raw */ }
+      }
+      // For broadcast conversations, prefix with sender name so the preview is self-contained
+      if (isBroadcast && !message.is_mine && message.sender_name) {
+        preview = `${message.sender_name}: ${preview}`;
       }
       if (preview && preview.length > 100) preview = preview.substring(0, 100) + '...';
 
@@ -567,9 +591,15 @@ class DatabaseService {
     if (dbMessage.content && dbMessage.content.startsWith('{')) {
       try {
         const parsed = JSON.parse(dbMessage.content);
-        if (parsed.type === 'photo' || parsed.type === 'location') {
+        const knownTypes = ['photo', 'location', 'sos', 'file', 'find_me_request', 'find_me_response'];
+        if (knownTypes.includes(parsed.type)) {
           contentType = parsed.type;
           mediaData = parsed;
+        } else if (parsed.type === 'text' && parsed.text) {
+          // Legacy rows stored full JSON envelope — unwrap to plain text
+          return {
+            ...this.normalizeMessage({ ...dbMessage, content: parsed.text }),
+          };
         }
       } catch (_e) { /* not JSON */ }
     }

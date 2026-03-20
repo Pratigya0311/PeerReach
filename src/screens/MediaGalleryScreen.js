@@ -11,6 +11,7 @@ import {
   ActivityIndicator,
   SafeAreaView,
   Linking,
+  Modal,
 } from 'react-native';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 import BridgefyService from '../services/BridgefyService';
@@ -26,10 +27,11 @@ const MediaGalleryScreen = ({ route }) => {
   const colors = useTheme();
   const styles = useMemo(() => makeStyles(colors), [colors]);
 
-  const [activeTab, setActiveTab]   = useState('Photos');
-  const [photos, setPhotos]         = useState([]);
-  const [locations, setLocations]   = useState([]);
-  const [isLoading, setIsLoading]   = useState(true);
+  const [activeTab, setActiveTab]       = useState('Photos');
+  const [photos, setPhotos]             = useState([]);
+  const [locations, setLocations]       = useState([]);
+  const [isLoading, setIsLoading]       = useState(true);
+  const [fullscreenPhoto, setFullscreenPhoto] = useState(null);
 
   useEffect(() => {
     loadMedia();
@@ -57,11 +59,13 @@ const MediaGalleryScreen = ({ route }) => {
   };
 
   const renderPhoto = ({ item }) => (
-    <Image
-      source={{ uri: `data:image/jpeg;base64,${item.mediaData?.data}` }}
-      style={styles.photoThumb}
-      resizeMode="cover"
-    />
+    <TouchableOpacity onPress={() => setFullscreenPhoto(item.mediaData?.data)} activeOpacity={0.8}>
+      <Image
+        source={{ uri: `data:image/jpeg;base64,${item.mediaData?.data}` }}
+        style={styles.photoThumb}
+        resizeMode="cover"
+      />
+    </TouchableOpacity>
   );
 
   const renderLocation = ({ item }) => {
@@ -116,6 +120,7 @@ const MediaGalleryScreen = ({ route }) => {
         </View>
       ) : activeTab === 'Photos' ? (
         <FlatList
+          key="photos-grid"
           data={photos}
           renderItem={renderPhoto}
           keyExtractor={(item) => item.id}
@@ -125,12 +130,26 @@ const MediaGalleryScreen = ({ route }) => {
         />
       ) : (
         <FlatList
+          key="locations-list"
           data={locations}
           renderItem={renderLocation}
           keyExtractor={(item) => item.id}
           contentContainerStyle={styles.locationList}
         />
       )}
+      {/* Fullscreen photo viewer */}
+      <Modal visible={!!fullscreenPhoto} transparent animationType="fade" onRequestClose={() => setFullscreenPhoto(null)}>
+        <TouchableOpacity style={styles.fullscreenOverlay} activeOpacity={1} onPress={() => setFullscreenPhoto(null)}>
+          {fullscreenPhoto && (
+            <Image
+              source={{ uri: `data:image/jpeg;base64,${fullscreenPhoto}` }}
+              style={styles.fullscreenImage}
+              resizeMode="contain"
+            />
+          )}
+          <Text style={styles.fullscreenClose}>✕  Tap to close</Text>
+        </TouchableOpacity>
+      </Modal>
     </SafeAreaView>
   );
 };
@@ -177,6 +196,16 @@ const makeStyles = (colors) => StyleSheet.create({
   locationCoords:   { fontSize: 14, fontWeight: '600', color: colors.text },
   locationMeta:     { fontSize: 12, color: colors.textMuted, marginTop: 2 },
   locationArrow:    { color: colors.textMuted, fontSize: 18, marginLeft: 8 },
+
+  fullscreenOverlay: {
+    flex: 1, backgroundColor: 'rgba(0,0,0,0.95)',
+    justifyContent: 'center', alignItems: 'center',
+  },
+  fullscreenImage: { width: '100%', height: '85%' },
+  fullscreenClose: {
+    position: 'absolute', bottom: 40,
+    color: 'rgba(255,255,255,0.7)', fontSize: 14,
+  },
 });
 
 export default MediaGalleryScreen;

@@ -12,12 +12,16 @@ import {
   Platform,
   RefreshControl,
   Modal,
+  ScrollView,
+  Linking,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect } from '@react-navigation/native';
 import Icon from 'react-native-vector-icons/MaterialIcons';
+import MCIcon from 'react-native-vector-icons/MaterialCommunityIcons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import BridgefyService from '../services/BridgefyService';
+import weatherService, { wmoInfo } from '../services/WeatherService';
 import { useTheme } from '../theme';
 
 const DISPLAY_NAME_KEY = '@peerreach_display_name';
@@ -35,6 +39,11 @@ const HomeScreen = ({ navigation }) => {
   const [unreadCounts, setUnreadCounts]       = useState({ total: 0, broadcast: 0, direct: 0 });
   const [refreshing, setRefreshing]           = useState(false);
   const [bridgefyStatus, setBridgefyStatus]   = useState('initializing');
+  const [weather, setWeather]                 = useState(null);
+  const [showWeatherModal, setShowWeatherModal] = useState(false);
+  const [myLocation, setMyLocation]           = useState(null);
+  const [showLocationModal, setShowLocationModal] = useState(false);
+  const [nearbyPeers, setNearbyPeers]         = useState([]);
 
   // Search state
   const [searchQuery, setSearchQuery]   = useState('');
@@ -60,6 +69,8 @@ const HomeScreen = ({ navigation }) => {
     BridgefyService.setOnReadyHandler(handleBridgefyReady);
     BridgefyService.setOnErrorHandler(handleBridgefyError);
     BridgefyService.setOnUnreadUpdatedHandler(handleUnreadUpdated);
+    // Refresh conversation names when a device announces their display name
+    BridgefyService.setOnDeviceListUpdatedHandler(() => loadData().catch(console.error));
 
     requestPermissions().then((granted) => {
       if (granted) {
@@ -72,6 +83,9 @@ const HomeScreen = ({ navigation }) => {
           [{ text: 'OK' }]
         );
       }
+    }).catch((err) => {
+      console.error('Permission request failed:', err);
+      setIsLoading(false);
     });
 
     return () => {
@@ -79,6 +93,8 @@ const HomeScreen = ({ navigation }) => {
       BridgefyService.setOnReadyHandler(null);
       BridgefyService.setOnErrorHandler(null);
       BridgefyService.setOnUnreadUpdatedHandler(null);
+      BridgefyService.setOnDeviceListUpdatedHandler(null);
+      weatherService.setOnWeatherUpdated(null);
       if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
       if (navTimerRef.current) clearTimeout(navTimerRef.current);
     };
@@ -123,7 +139,7 @@ const HomeScreen = ({ navigation }) => {
     try {
       setBridgefyStatus('initializing');
       console.log('🚀 Initializing Bridgefy...');
-      const API_KEY = process.env.GROQ_API_KEY;
+      const API_KEY = '8a349463-829d-4c67-a489-4a4c5cb82eba';
       if (!API_KEY || API_KEY.length < 36) {
         Alert.alert('Invalid API Key', 'Please check your Bridgefy API key configuration.');
         setIsLoading(false);
@@ -184,12 +200,38 @@ const HomeScreen = ({ navigation }) => {
     setBridgefyStatus('ready');
     setIsLoading(false);
     loadData().catch(err => console.error('Error loading data on ready:', err));
+    // Show cached weather immediately, then get live updates via WeatherService
+    const cached = weatherService.getData();
+    if (cached) setWeather(cached);
+    weatherService.setOnWeatherUpdated((wd) => setWeather(wd));
+    // Seed location pill and nearby peers, then keep both fresh
+    const refreshLoc = () => {
+      const l = BridgefyService.getMyLocation();
+      setMyLocation(l || null);
+      BridgefyService.getConnectedDevices()
+        .then(devs => setNearbyPeers(devs))
+        .catch(() => {});
+    };
+    refreshLoc();
+    const locInterval = setInterval(refreshLoc, 30000);
+    return () => clearInterval(locInterval);
   };
   const handleBridgefyError  = (error) => {
     console.warn('⚠️ Bridgefy error:', error);
     if (navTimerRef.current) clearTimeout(navTimerRef.current);
     setBridgefyStatus('error');
     setIsLoading(false);
+    const msg = error?.error || error?.message || '';
+    if (msg.toLowerCase().includes('location')) {
+      Alert.alert(
+        'Location Services Off',
+        'Bridgefy requires Location to be enabled (not just permitted) for BLE scanning on Android 6+.\n\nGo to Settings → Location and turn it on.',
+        [
+          { text: 'Open Settings', onPress: () => Linking.sendIntent('android.settings.LOCATION_SOURCE_SETTINGS') },
+          { text: 'Dismiss', style: 'cancel' },
+        ]
+      );
+    }
   };
   const handleUnreadUpdated  = (counts) => setUnreadCounts(counts);
 
@@ -292,7 +334,7 @@ const HomeScreen = ({ navigation }) => {
           style={[styles.lastMessage, item.unreadCount > 0 && styles.unreadLastMessage]}
           numberOfLines={2}
         >
-          {item.isBroadcast ? `${item.senderName}: ` : ''}{item.lastMessage}
+          {item.lastMessage}
         </Text>
       </View>
     </TouchableOpacity>
@@ -383,6 +425,193 @@ const HomeScreen = ({ navigation }) => {
         </View>
       </Modal>
 
+      {/* Weather report modal */}
+      <Modal visible={showWeatherModal} transparent animationType="slide" onRequestClose={() => setShowWeatherModal(false)}>
+        <View style={styles.wModalOverlay}>
+          <View style={styles.wModalCard}>
+            {/* Handle bar */}
+            <View style={styles.wModalHandle} />
+
+            {weather?.current ? (() => {
+              const info = wmoInfo(weather.current.code);
+              const source = weatherService.source;
+              const age = weather.timestamp ? Math.round((Date.now() - weather.timestamp) / 60000) : null;
+              return (
+                <>
+                  {/* City + close */}
+                  <View style={styles.wModalTopRow}>
+                    <Text style={styles.wModalCity}>{weather.city || 'Unknown location'}</Text>
+                    <TouchableOpacity onPress={() => setShowWeatherModal(false)}>
+                      <Icon name="close" size={22} color={colors.textMuted} />
+                    </TouchableOpacity>
+                  </View>
+
+                  {/* Big icon + temp */}
+                  <View style={styles.wModalHero}>
+                    <MCIcon name={info.icon} size={64} color={info.color} />
+                    <Text style={styles.wModalTemp}>{weather.current.temp}°C</Text>
+                    <Text style={styles.wModalDesc}>{info.desc}</Text>
+                  </View>
+
+                  {/* Details row */}
+                  <View style={styles.wDetailsRow}>
+                    {weather.current.feelsLike != null && (
+                      <View style={styles.wDetailItem}>
+                        <MCIcon name="thermometer" size={16} color={colors.textMuted} />
+                        <Text style={styles.wDetailLabel}>Feels like</Text>
+                        <Text style={styles.wDetailValue}>{weather.current.feelsLike}°</Text>
+                      </View>
+                    )}
+                    {weather.current.humidity != null && (
+                      <View style={styles.wDetailItem}>
+                        <MCIcon name="water-percent" size={16} color={colors.textMuted} />
+                        <Text style={styles.wDetailLabel}>Humidity</Text>
+                        <Text style={styles.wDetailValue}>{weather.current.humidity}%</Text>
+                      </View>
+                    )}
+                    {weather.current.windSpeed != null && (
+                      <View style={styles.wDetailItem}>
+                        <MCIcon name="weather-windy" size={16} color={colors.textMuted} />
+                        <Text style={styles.wDetailLabel}>Wind</Text>
+                        <Text style={styles.wDetailValue}>{weather.current.windSpeed} km/h</Text>
+                      </View>
+                    )}
+                  </View>
+
+                  {/* Hourly strip */}
+                  {weather.hourly?.length > 0 && (
+                    <>
+                      <Text style={styles.wSectionLabel}>Next 6 hours</Text>
+                      <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.wHourlyScroll}>
+                        {weather.hourly.map((h, i) => {
+                          const hi = wmoInfo(h.code);
+                          return (
+                            <View key={i} style={styles.wHourlyItem}>
+                              <Text style={styles.wHourlyTime}>{h.time}</Text>
+                              <MCIcon name={hi.icon} size={20} color={hi.color} />
+                              <Text style={styles.wHourlyTemp}>{h.temp}°</Text>
+                              {h.precipChance > 0 && (
+                                <Text style={styles.wHourlyPrecip}>{h.precipChance}%</Text>
+                              )}
+                            </View>
+                          );
+                        })}
+                      </ScrollView>
+                    </>
+                  )}
+
+                  {/* Daily forecast */}
+                  {weather.daily?.length > 0 && (
+                    <>
+                      <Text style={styles.wSectionLabel}>3-day forecast</Text>
+                      {weather.daily.map((d, i) => {
+                        const di = wmoInfo(d.code);
+                        return (
+                          <View key={i} style={styles.wDailyRow}>
+                            <Text style={styles.wDailyLabel}>{d.label}</Text>
+                            <MCIcon name={di.icon} size={18} color={di.color} />
+                            <Text style={styles.wDailyDesc}>{di.desc}</Text>
+                            <View style={styles.wDailyTemps}>
+                              <Text style={styles.wDailyHigh}>{d.high}°</Text>
+                              <Text style={styles.wDailyLow}>{d.low}°</Text>
+                            </View>
+                          </View>
+                        );
+                      })}
+                    </>
+                  )}
+
+                  {/* Source + age */}
+                  <View style={styles.wFooter}>
+                    <View style={[styles.wSourceBadge, source === 'gps' ? styles.wSourceGps : source === 'mesh' ? styles.wSourceMesh : styles.wSourceCache]}>
+                      <Text style={styles.wSourceText}>{source === 'gps' ? 'GPS' : source === 'mesh' ? 'Mesh' : 'Cache'}</Text>
+                    </View>
+                    {age != null && <Text style={styles.wAgeText}>Updated {age < 1 ? 'just now' : age < 60 ? `${age}m ago` : `${Math.round(age / 60)}h ago`}</Text>}
+                    {weather.isStale && (
+                      <View style={styles.wStaleBadge}>
+                        <MCIcon name="alert-outline" size={12} color="#E65100" />
+                        <Text style={styles.wStaleText}>May be outdated</Text>
+                      </View>
+                    )}
+                  </View>
+                </>
+              );
+            })() : (
+              <View style={{ alignItems: 'center', padding: 32 }}>
+                <Text style={{ color: colors.textMuted }}>No weather data available</Text>
+              </View>
+            )}
+          </View>
+        </View>
+      </Modal>
+
+      {/* Location modal */}
+      <Modal visible={showLocationModal} transparent animationType="slide" onRequestClose={() => setShowLocationModal(false)}>
+        <View style={styles.wModalOverlay}>
+          <View style={styles.wModalCard}>
+            <View style={styles.wModalHandle} />
+            <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 16, gap: 8 }}>
+              <Icon name={myLocation ? 'my-location' : 'people'} size={22} color={colors.primary} />
+              <Text style={styles.wModalTitle}>
+                {myLocation ? 'My Last Known Location' : 'Nearby Devices'}
+              </Text>
+            </View>
+            {myLocation ? (() => {
+              const ageSec  = Math.floor((Date.now() - myLocation.ts) / 1000);
+              const ageMins = Math.floor(ageSec / 60);
+              const ageStr  = ageSec < 30 ? 'Just now' : ageMins < 60 ? `${ageMins}m ago` : `${Math.floor(ageMins / 60)}h ago`;
+              return (
+                <>
+                  <View style={styles.locRow}>
+                    <Text style={styles.locLabel}>Latitude</Text>
+                    <Text style={styles.locValue}>{myLocation.lat.toFixed(6)}</Text>
+                  </View>
+                  <View style={styles.locRow}>
+                    <Text style={styles.locLabel}>Longitude</Text>
+                    <Text style={styles.locValue}>{myLocation.lng.toFixed(6)}</Text>
+                  </View>
+                  <View style={[styles.locRow, { marginTop: 8 }]}>
+                    <Icon name="access-time" size={14} color={colors.textMuted} />
+                    <Text style={[styles.locLabel, { marginLeft: 4 }]}>Fixed {ageStr}</Text>
+                  </View>
+                  <Text style={styles.locPrivacyNote}>
+                    This location is stored only on your device and is never shared automatically.
+                  </Text>
+                </>
+              );
+            })() : nearbyPeers.length > 0 ? (
+              <>
+                <Text style={[styles.locLabel, { marginBottom: 12 }]}>
+                  No GPS fix yet — showing nearby mesh devices:
+                </Text>
+                {nearbyPeers.map(peer => (
+                  <View key={peer.id} style={styles.locRow}>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                      <Icon name="person" size={16} color={colors.primary} />
+                      <Text style={styles.locValue}>{peer.name}</Text>
+                    </View>
+                    {peer.battery != null && (
+                      <Text style={styles.locLabel}>{peer.battery}%</Text>
+                    )}
+                  </View>
+                ))}
+                <Text style={styles.locPrivacyNote}>
+                  These are devices connected to you on the mesh right now.
+                </Text>
+              </>
+            ) : (
+              <View style={{ alignItems: 'center', padding: 32 }}>
+                <Icon name="location-off" size={36} color={colors.textMuted} />
+                <Text style={{ color: colors.textMuted, marginTop: 8 }}>No GPS fix and no nearby devices</Text>
+              </View>
+            )}
+            <TouchableOpacity style={styles.wCloseBtn} onPress={() => setShowLocationModal(false)}>
+              <Text style={styles.wCloseBtnText}>Close</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
       {/* Header */}
       <View style={styles.header}>
         <View style={styles.headerTop}>
@@ -418,6 +647,26 @@ const HomeScreen = ({ navigation }) => {
             {bridgefyStatus === 'ready' ? 'Online' : 'Offline'}
             {conversations.length > 0 && ` · ${conversations.length} conversation${conversations.length !== 1 ? 's' : ''}`}
           </Text>
+          {weather?.current ? (
+            <TouchableOpacity style={styles.weatherWidget} onPress={() => setShowWeatherModal(true)}>
+              <MCIcon name={wmoInfo(weather.current.code).icon} size={14} color={wmoInfo(weather.current.code).color} />
+              <Text style={styles.weatherText}>{weather.current.temp}°  {weather.city}</Text>
+            </TouchableOpacity>
+          ) : null}
+          {(myLocation || nearbyPeers.length > 0) ? (
+            <TouchableOpacity style={styles.weatherWidget} onPress={() => setShowLocationModal(true)}>
+              <Icon
+                name={myLocation ? 'my-location' : 'people'}
+                size={13}
+                color={colors.headerStatusText}
+              />
+              <Text style={styles.weatherText}>
+                {myLocation
+                  ? `${myLocation.lat.toFixed(3)}, ${myLocation.lng.toFixed(3)}`
+                  : `${nearbyPeers.length} nearby`}
+              </Text>
+            </TouchableOpacity>
+          ) : null}
         </View>
       </View>
 
@@ -572,7 +821,7 @@ const makeStyles = (colors) => StyleSheet.create({
   statusDot: { width: 8, height: 8, borderRadius: 4, marginRight: 6 },
   dotOnline:  { backgroundColor: colors.success },
   dotOffline: { backgroundColor: colors.error },
-  status: { fontSize: 12, color: colors.headerStatusText },
+  status:      { fontSize: 12, color: colors.headerStatusText },
 
   // Action buttons
   actionButtons: {
@@ -690,6 +939,72 @@ const makeStyles = (colors) => StyleSheet.create({
   emptySubtext: { fontSize: 14, color: colors.textMuted, textAlign: 'center', marginBottom: 24, lineHeight: 20 },
   emptyButton:  { backgroundColor: colors.primary, paddingHorizontal: 24, paddingVertical: 12, borderRadius: 8 },
   emptyButtonText: { color: colors.onColor, fontSize: 16, fontWeight: '600' },
+
+  // Weather widget (status row)
+  weatherWidget: { flexDirection: 'row', alignItems: 'center', gap: 4, marginLeft: 10 },
+  weatherText:   { fontSize: 12, color: colors.headerStatusText, opacity: 0.9 },
+
+  // Weather report modal
+  wModalOverlay: {
+    flex: 1, backgroundColor: 'rgba(0,0,0,0.5)',
+    justifyContent: 'flex-end',
+  },
+  wModalCard: {
+    backgroundColor: colors.surface, borderTopLeftRadius: 20, borderTopRightRadius: 20,
+    padding: 20, paddingBottom: 36, maxHeight: '85%',
+  },
+  wModalHandle: {
+    width: 40, height: 4, borderRadius: 2,
+    backgroundColor: colors.border, alignSelf: 'center', marginBottom: 16,
+  },
+  wModalTopRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
+  wModalCity:   { fontSize: 16, fontWeight: '600', color: colors.text, flex: 1 },
+  wModalHero:   { alignItems: 'center', marginVertical: 12 },
+  wModalTemp:   { fontSize: 56, fontWeight: '200', color: colors.text, marginTop: 8 },
+  wModalDesc:   { fontSize: 16, color: colors.textSecondary, marginTop: 4 },
+
+  wDetailsRow:  { flexDirection: 'row', justifyContent: 'space-around', marginVertical: 16,
+                  backgroundColor: colors.surfaceVariant, borderRadius: 12, padding: 12 },
+  wDetailItem:  { alignItems: 'center', gap: 4 },
+  wDetailLabel: { fontSize: 11, color: colors.textMuted },
+  wDetailValue: { fontSize: 14, fontWeight: '600', color: colors.text },
+
+  wSectionLabel: { fontSize: 12, fontWeight: '600', color: colors.textMuted,
+                   textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 8, marginTop: 4 },
+
+  wHourlyScroll: { marginBottom: 12 },
+  wHourlyItem:   { alignItems: 'center', paddingHorizontal: 12, paddingVertical: 8,
+                   backgroundColor: colors.surfaceVariant, borderRadius: 10, marginRight: 8, minWidth: 56 },
+  wHourlyTime:   { fontSize: 11, color: colors.textMuted, marginBottom: 4 },
+  wHourlyTemp:   { fontSize: 14, fontWeight: '600', color: colors.text, marginTop: 4 },
+  wHourlyPrecip: { fontSize: 10, color: '#42A5F5', marginTop: 2 },
+
+  wDailyRow:    { flexDirection: 'row', alignItems: 'center', paddingVertical: 10,
+                  borderTopWidth: 1, borderTopColor: colors.border },
+  wDailyLabel:  { width: 52, fontSize: 14, fontWeight: '500', color: colors.text },
+  wDailyDesc:   { flex: 1, fontSize: 13, color: colors.textSecondary, marginLeft: 8 },
+  wDailyTemps:  { flexDirection: 'row', gap: 8 },
+  wDailyHigh:   { fontSize: 14, fontWeight: '600', color: colors.text },
+  wDailyLow:    { fontSize: 14, color: colors.textMuted },
+
+  wFooter:      { flexDirection: 'row', alignItems: 'center', gap: 10, marginTop: 16 },
+  wSourceBadge: { paddingHorizontal: 10, paddingVertical: 3, borderRadius: 12 },
+  wSourceGps:   { backgroundColor: colors.success + '30' },
+  wSourceMesh:  { backgroundColor: colors.primary + '30' },
+  wSourceCache: { backgroundColor: colors.border },
+  wSourceText:  { fontSize: 11, fontWeight: '700', color: colors.text },
+  wAgeText:     { fontSize: 12, color: colors.textMuted },
+  wStaleBadge:  { flexDirection: 'row', alignItems: 'center', gap: 3, backgroundColor: '#E6510020', borderRadius: 10, paddingHorizontal: 8, paddingVertical: 2 },
+  wStaleText:   { fontSize: 11, color: '#E65100', fontWeight: '500' },
+  wModalTitle:  { fontSize: 17, fontWeight: '700', color: colors.text },
+  wCloseBtn:    { marginTop: 20, backgroundColor: colors.primary, borderRadius: 10, paddingVertical: 12, alignItems: 'center' },
+  wCloseBtnText:{ color: '#fff', fontWeight: '600', fontSize: 15 },
+
+  // Location pill styles
+  locRow:         { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: colors.border },
+  locLabel:       { fontSize: 13, color: colors.textMuted },
+  locValue:       { fontSize: 15, fontWeight: '600', color: colors.text, fontVariant: ['tabular-nums'] },
+  locPrivacyNote: { fontSize: 12, color: colors.textMuted, marginTop: 16, lineHeight: 17, fontStyle: 'italic' },
 
   // First-launch name modal
   modalOverlay: {

@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useMemo } from 'react';
+import React, { useState, useCallback, useMemo, useEffect } from 'react';
 import {
   View,
   Text,
@@ -10,6 +10,7 @@ import {
   RefreshControl,
 } from 'react-native';
 import { useFocusEffect } from '@react-navigation/native';
+import Icon from 'react-native-vector-icons/MaterialIcons';
 import BridgefyService from '../services/BridgefyService';
 import { useTheme } from '../theme';
 
@@ -24,6 +25,11 @@ const DevicesScreen = ({ navigation }) => {
   useFocusEffect(
     useCallback(() => { loadDevices(); }, [])
   );
+
+  useEffect(() => {
+    BridgefyService.setOnDeviceListUpdatedHandler(() => loadDevices(true));
+    return () => BridgefyService.setOnDeviceListUpdatedHandler(null);
+  }, []);
 
   const loadDevices = async (isRefresh = false) => {
     try {
@@ -57,25 +63,50 @@ const DevicesScreen = ({ navigation }) => {
     });
   };
 
-  const renderDevice = ({ item }) => (
-    <TouchableOpacity style={styles.deviceCard} onPress={() => startChat(item)}>
-      <View style={styles.deviceIcon}>
-        <Text style={styles.deviceIconText}>
-          {(item.name || '?')[0].toUpperCase()}
-        </Text>
-      </View>
+  const formatLastSeen = (ts) => {
+    if (!ts) return null;
+    const diff = Date.now() - ts;
+    const secs = Math.floor(diff / 1000);
+    if (secs < 30)  return 'Just now';
+    if (secs < 60)  return `${secs}s ago`;
+    const mins = Math.floor(secs / 60);
+    if (mins < 60)  return `${mins}m ago`;
+    const hrs = Math.floor(mins / 60);
+    return `${hrs}h ago`;
+  };
 
-      <View style={styles.deviceInfo}>
-        <Text style={styles.deviceName}>{item.name}</Text>
-        <Text style={styles.deviceId}>
-          ID: {item.id ? `${item.id.substring(0, 12)}...` : 'Unknown'}
-        </Text>
-      </View>
+  const renderDevice = ({ item }) => {
+    const lastSeenLabel = formatLastSeen(item.lastSeen);
+    return (
+      <TouchableOpacity style={styles.deviceCard} onPress={() => startChat(item)}>
+        <View style={styles.deviceIcon}>
+          <Text style={styles.deviceIconText}>
+            {(item.name || '?')[0].toUpperCase()}
+          </Text>
+        </View>
 
-      <View style={styles.connectionDot} />
-      <Text style={styles.connectText}>Chat →</Text>
-    </TouchableOpacity>
-  );
+        <View style={styles.deviceInfo}>
+          <Text style={styles.deviceName}>{item.name}</Text>
+          <Text style={styles.deviceId}>
+            ID: {item.id ? `${item.id.substring(0, 12)}...` : 'Unknown'}
+          </Text>
+          {lastSeenLabel && (
+            <Text style={styles.deviceLastSeen}>Last seen: {lastSeenLabel}</Text>
+          )}
+        </View>
+
+        <View style={styles.deviceRight}>
+          {item.battery != null && (
+            <View style={styles.batteryRow}>
+              <Text style={styles.batteryText}>{item.battery}%</Text>
+            </View>
+          )}
+          <View style={styles.connectionDot} />
+          <Text style={styles.connectText}>Chat →</Text>
+        </View>
+      </TouchableOpacity>
+    );
+  };
 
   if (isLoading) {
     return (
@@ -158,6 +189,10 @@ const makeStyles = (colors) => StyleSheet.create({
   deviceInfo:     { flex: 1 },
   deviceName:     { fontSize: 16, fontWeight: '600', color: colors.text, marginBottom: 4 },
   deviceId:       { fontSize: 12, color: colors.textMuted },
+  deviceRight:    { alignItems: 'flex-end', gap: 4 },
+  batteryRow:     { flexDirection: 'row', alignItems: 'center' },
+  batteryText:    { fontSize: 11, color: colors.textMuted, fontWeight: '600' },
+  deviceLastSeen: { fontSize: 11, color: colors.textMuted, marginTop: 2 },
   connectionDot:  { width: 10, height: 10, borderRadius: 5, backgroundColor: colors.success, marginRight: 8 },
   connectText:    { color: colors.connectText, fontSize: 14, fontWeight: '600' },
 
