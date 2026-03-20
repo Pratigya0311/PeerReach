@@ -25,6 +25,7 @@ class BridgefyService {
     this.seenAnnounces = new Map();
     this.announceTimer = null;
     this.sendCooldowns = new Map();
+    this.offlineBlocked = new Set();
     this.pendingSendMap = new Map();
     this.lastApiKey = null;
     this.healthTimer = null;
@@ -68,6 +69,7 @@ class BridgefyService {
       this.startAnnounceLoop();
       this.sendAnnounce('online', 0);
       this.flushQueuedMessages();
+      this.flushQueuedBroadcasts();
       
       this.emitEvent('onReady', { deviceId: this.myDeviceId, deviceName: this.myDeviceName });
     });
@@ -77,6 +79,7 @@ class BridgefyService {
       console.log('📱 Device connected:', device);
       if (device.userId) {
         this.connectedDevices.set(device.userId, device.deviceName || `Device_${device.userId.substring(0, 8)}`);
+        this.offlineBlocked.delete(device.userId);
         
         // Save to database
         await databaseService.saveDevice({
@@ -86,7 +89,8 @@ class BridgefyService {
         });
 
       this.sendAnnounce('online', 0);
-      this.flushQueuedMessages();
+      await this.flushQueuedMessages(device.userId);
+      await this.flushQueuedBroadcasts();
         
         this.emitEvent('onDeviceConnected', device);
       }
@@ -96,6 +100,7 @@ class BridgefyService {
       console.log('📱 Device lost:', device);
       if (device.userId) {
         this.connectedDevices.delete(device.userId);
+        this.offlineBlocked.add(device.userId);
         
         // Update status in database
         await databaseService.updateDeviceStatus(device.userId, 'offline');
@@ -127,6 +132,7 @@ class BridgefyService {
         for (const device of data.devices) {
           if (device.id && device.name) {
             this.connectedDevices.set(device.id, device.name);
+            this.offlineBlocked.delete(device.id);
             await databaseService.saveDevice({
               id: device.id,
               name: device.name,
@@ -134,6 +140,7 @@ class BridgefyService {
             });
           }
         }
+        await this.flushQueuedBroadcasts();
         this.emitEvent('onDeviceListUpdated', {
           devices: Array.from(this.connectedDevices.entries()).map(([id, name]) => ({ id, name }))
         });
@@ -254,6 +261,7 @@ class BridgefyService {
       this.pruneAnnounces();
       this.sendAnnounce('online', 0);
       this.flushQueuedMessages();
+      this.flushQueuedBroadcasts();
       await this.pruneKnownUsers();
     }, ANNOUNCE_INTERVAL_MS);
   }
@@ -334,6 +342,13 @@ class BridgefyService {
         is_online: status === 'online' ? 1 : 0
       });
 
+      if (status === 'online') {
+        this.offlineBlocked.delete(userId);
+        await this.flushQueuedMessages(userId);
+      } else {
+        this.offlineBlocked.add(userId);
+      }
+
       if (distance < MAX_HOPS) {
         const forwardPayload = {
           type: 'announce',
@@ -354,13 +369,13 @@ class BridgefyService {
     }
   }
   isInCooldown(receiverId) {
+    if (this.offlineBlocked.has(receiverId)) return true;
     const until = this.sendCooldowns.get(receiverId);
     return until && Date.now() < until;
   }
 
   applySendFailure(receiverId) {
-    const cooldownMs = 60000;
-    this.sendCooldowns.set(receiverId, Date.now() + cooldownMs);
+    this.offlineBlocked.add(receiverId);
     databaseService.upsertKnownUser({
       id: receiverId,
       name: this.connectedDevices.get(receiverId) || 'Unknown Device',
@@ -401,6 +416,36 @@ class BridgefyService {
     };
   }
 
+  async queueBroadcastMessage(text) {
+    const dbMessage = {
+      id: `queued_broadcast_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      content: text,
+      sender_id: this.myDeviceId,
+      sender_name: this.myDeviceName,
+      receiver_id: null,
+      message_type: 'broadcast',
+      is_mine: true,
+      is_broadcast: true,
+      timestamp: Date.now(),
+      read_status: 1,
+      delivery_status: 'queued'
+    };
+    await databaseService.saveMessage(dbMessage);
+    return {
+      id: dbMessage.id,
+      text: text,
+      senderId: this.myDeviceId,
+      senderName: this.myDeviceName,
+      receiverId: null,
+      timestamp: Date.now(),
+      isMine: true,
+      isBroadcast: true,
+      type: 'text',
+      read: true,
+      deliveryStatus: 'queued'
+    };
+  }
+
   startHealthCheck() {
     if (this.healthTimer) return;
     this.healthTimer = setInterval(() => {
@@ -429,6 +474,7 @@ class BridgefyService {
         this.startAnnounceLoop();
         this.sendAnnounce('online', 0);
         this.flushQueuedMessages();
+        this.flushQueuedBroadcasts();
         this.isRestarting = false;
         this.emitEvent('onReconnected', {});
       }
@@ -460,7 +506,8 @@ class BridgefyService {
     const queued = await databaseService.getQueuedMessages(receiverId);
     for (const msg of queued) {
       try {
-        if (this.isInCooldown(msg.receiverId)) {
+        const canSend = await this.isReceiverOnline(msg.receiverId);
+        if (!canSend || this.isInCooldown(msg.receiverId)) {
           continue;
         }
         if (!this.isDirectDevice(msg.receiverId)) {
@@ -471,6 +518,19 @@ class BridgefyService {
         await databaseService.updateMessageStatus(msg.id, 'sent');
       } catch (error) {
         this.applySendFailure(msg.receiverId);
+      }
+    }
+  }
+
+  async flushQueuedBroadcasts() {
+    if (this.connectedDevices.size === 0) return;
+    const queued = await databaseService.getQueuedBroadcastMessages();
+    for (const msg of queued) {
+      try {
+        await Bridgefy.sendBroadcast(msg.text);
+        await databaseService.updateMessageStatus(msg.id, 'sent');
+      } catch (error) {
+        break;
       }
     }
   }
@@ -488,6 +548,7 @@ class BridgefyService {
         this.startAnnounceLoop();
         this.sendAnnounce('online', 0);
         this.flushQueuedMessages();
+        this.flushQueuedBroadcasts();
         this.startHealthCheck();
       }
       return;
@@ -519,7 +580,7 @@ class BridgefyService {
       return true;
     } catch (error) {
       console.error('Bridgefy initialization failed:', error);
-      throw error;
+      return this.queueBroadcastMessage(text);
     } finally {
       this.isInitializing = false;
     }
@@ -528,7 +589,8 @@ class BridgefyService {
   async sendMessage(receiverId, text) {
     try {
       console.log(`📤 Sending to ${receiverId}: ${text}`);
-      if (this.isInCooldown(receiverId)) {
+      const canSend = await this.isReceiverOnline(receiverId);
+      if (!canSend || this.isInCooldown(receiverId)) {
         return this.queueOutgoingMessage(receiverId, text);
       }
       const response = await Bridgefy.sendMessage(receiverId, text);
@@ -575,7 +637,8 @@ class BridgefyService {
   async sendMeshMessage(receiverId, text) {
     try {
       console.log(`Sending mesh to ${receiverId}: ${text}`);
-      if (this.isInCooldown(receiverId)) {
+      const canSend = await this.isReceiverOnline(receiverId);
+      if (!canSend || this.isInCooldown(receiverId)) {
         return this.queueOutgoingMessage(receiverId, text);
       }
       if (Bridgefy.sendMeshMessage) {
@@ -620,6 +683,9 @@ class BridgefyService {
   async sendBroadcast(text) {
     try {
       console.log(`📢 Broadcasting: ${text}`);
+      if (this.connectedDevices.size === 0) {
+        return this.queueBroadcastMessage(text);
+      }
       const response = await Bridgefy.sendBroadcast(text);
       
       // Create database message
@@ -653,7 +719,7 @@ class BridgefyService {
       };
     } catch (error) {
       console.error('❌ Broadcast failed:', error);
-      throw error;
+      return this.queueBroadcastMessage(text);
     }
   }
 
@@ -834,6 +900,18 @@ class BridgefyService {
 
   isDirectDevice(deviceId) {
     return this.connectedDevices.has(deviceId);
+  }
+
+  async isReceiverOnline(receiverId) {
+    try {
+      if (this.isDirectDevice(receiverId)) return true;
+      const user = await databaseService.getKnownUser(receiverId);
+      if (!user) return false;
+      const fresh = Date.now() - user.last_seen <= ANNOUNCE_TTL_MS;
+      return user.is_online === 1 && fresh;
+    } catch (_e) {
+      return false;
+    }
   }
 
   async getMyDeviceId() {

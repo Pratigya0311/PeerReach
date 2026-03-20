@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   View,
   Text,
@@ -13,7 +13,11 @@ import {
   SafeAreaView,
 } from 'react-native';
 import { useFocusEffect } from '@react-navigation/native';
+import NetInfo from '@react-native-community/netinfo';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import BridgefyService from '../services/BridgefyService';
+
+const FIRST_RUN_KEY = '@peerreach_first_run_done';
 
 const HomeScreen = ({ navigation }) => {
   const [conversations, setConversations] = useState([]);
@@ -23,6 +27,12 @@ const HomeScreen = ({ navigation }) => {
   const [unreadCounts, setUnreadCounts] = useState({ total: 0, broadcast: 0, direct: 0 });
   const [refreshing, setRefreshing] = useState(false);
   const [bridgefyStatus, setBridgefyStatus] = useState('initializing');
+  const [permissionsGranted, setPermissionsGranted] = useState(false);
+  const [firstRunPending, setFirstRunPending] = useState(true);
+  const [hasNetwork, setHasNetwork] = useState(true);
+  const networkAlertedRef = useRef(false);
+  const btAlertedRef = useRef(false);
+  const btRetryTimerRef = useRef(null);
 
   useFocusEffect(
     useCallback(() => {
@@ -43,9 +53,8 @@ const HomeScreen = ({ navigation }) => {
     BridgefyService.setOnReconnectedHandler(handleReconnected);
 
     requestPermissions().then((granted) => {
-      if (granted) {
-        initializeBridgefy();
-      } else {
+      setPermissionsGranted(granted);
+      if (!granted) {
         setIsLoading(false);
         Alert.alert(
           'Permissions Required',
@@ -70,8 +79,44 @@ const HomeScreen = ({ navigation }) => {
       BridgefyService.setOnUnreadUpdatedHandler(null);
       BridgefyService.setOnReconnectingHandler(null);
       BridgefyService.setOnReconnectedHandler(null);
+      if (btRetryTimerRef.current) {
+        clearInterval(btRetryTimerRef.current);
+        btRetryTimerRef.current = null;
+      }
     };
   }, []);
+
+  useEffect(() => {
+    AsyncStorage.getItem(FIRST_RUN_KEY)
+      .then((value) => setFirstRunPending(!value))
+      .catch(() => setFirstRunPending(true));
+  }, []);
+
+  useEffect(() => {
+    const unsubscribe = NetInfo.addEventListener((state) => {
+      const connected = !!state.isConnected;
+      setHasNetwork(connected);
+      if (firstRunPending && !connected && !networkAlertedRef.current) {
+        networkAlertedRef.current = true;
+        Alert.alert(
+          'Internet Required',
+          'Internet connectivity is required only for first-time activation. Please connect and we will continue automatically.'
+        );
+        setIsLoading(false);
+        setBridgefyStatus('error');
+      }
+      if (connected) {
+        networkAlertedRef.current = false;
+      }
+    });
+    return () => unsubscribe();
+  }, [firstRunPending]);
+
+  useEffect(() => {
+    if (!permissionsGranted) return;
+    if (firstRunPending && !hasNetwork) return;
+    initializeBridgefy();
+  }, [permissionsGranted, firstRunPending, hasNetwork]);
 
     const requestPermissions = async () => {
     if (Platform.OS === 'android') {
@@ -183,13 +228,41 @@ const HomeScreen = ({ navigation }) => {
     setMyDeviceId(data.deviceId);
     setMyDeviceName(data.deviceName);
     setBridgefyStatus('ready');
+    setIsLoading(false);
+    AsyncStorage.setItem(FIRST_RUN_KEY, '1').catch(() => {});
+    setFirstRunPending(false);
+    if (btRetryTimerRef.current) {
+      clearInterval(btRetryTimerRef.current);
+      btRetryTimerRef.current = null;
+    }
     loadData();
   };
 
   const handleBridgefyError = (error) => {
-    console.error('❌ Bridgefy error:', error);
+    console.error('Bridgefy error:', error);
+    const message = (error && error.message) ? String(error.message) : String(error || '');
+    if (/bluetooth/i.test(message)) {
+      setBridgefyStatus('error');
+      setIsLoading(false);
+      if (!btAlertedRef.current) {
+        btAlertedRef.current = true;
+        Alert.alert(
+          'Bluetooth Off',
+          'Please turn on Bluetooth. PeerReach will retry automatically when Bluetooth is back on.'
+        );
+      }
+      if (!btRetryTimerRef.current) {
+        btRetryTimerRef.current = setInterval(() => {
+          if (!permissionsGranted) return;
+          if (firstRunPending && !hasNetwork) return;
+          initializeBridgefy();
+        }, 15000);
+      }
+      return;
+    }
     setBridgefyStatus('error');
-    Alert.alert('Bridgefy Error', error.message || 'Unknown error occurred');
+    setIsLoading(false);
+    Alert.alert('Bridgefy Error', message || 'Unknown error occurred');
   };
 
   const handleReconnecting = () => {

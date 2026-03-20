@@ -496,6 +496,22 @@ class DatabaseService {
     }
   }
 
+  async getQueuedBroadcastMessages() {
+    try {
+      await this.ensureInitialized();
+      const query = `SELECT * FROM messages WHERE delivery_status = 'queued' AND message_type = 'broadcast' ORDER BY timestamp ASC;`;
+      const [results] = await this.db.executeSql(query);
+      const messages = [];
+      for (let i = 0; i < results.rows.length; i++) {
+        messages.push(this.normalizeMessage(results.rows.item(i)));
+      }
+      return messages;
+    } catch (error) {
+      console.error('Error getting queued broadcast messages:', error);
+      throw error;
+    }
+  }
+
   // ============ KNOWN USERS (MULTI-HOP) ============
 
   async upsertKnownUser(user) {
@@ -539,6 +555,20 @@ class DatabaseService {
       return users;
     } catch (error) {
       console.error('Error getting known users:', error);
+      throw error;
+    }
+  }
+
+  async getKnownUser(userId) {
+    try {
+      await this.ensureInitialized();
+      const [results] = await this.db.executeSql(
+        'SELECT * FROM known_users WHERE id = ? LIMIT 1;',
+        [userId]
+      );
+      return results.rows.item(0) || null;
+    } catch (error) {
+      console.error('Error getting known user:', error);
       throw error;
     }
   }
