@@ -76,20 +76,22 @@ class BridgefyService {
 
     // Device connection events
     bridgefyEmitter.addListener('onDeviceConnected', async (device) => {
-      console.log('📱 Device connected:', device);
-      if (device.userId) {
-        this.connectedDevices.set(device.userId, device.deviceName || `Device_${device.userId.substring(0, 8)}`);
-        this.offlineBlocked.delete(device.userId);
+      console.log('Device connected:', device);
+      const id = device?.userId || device?.id;
+      const name = device?.deviceName || device?.name;
+      if (id) {
+        this.connectedDevices.set(id, name || `Device_${id.substring(0, 8)}`);
+        this.offlineBlocked.delete(id);
         
         // Save to database
         await databaseService.saveDevice({
-          id: device.userId,
-          name: device.deviceName || `Device_${device.userId.substring(0, 8)}`,
+          id: id,
+          name: name || `Device_${id.substring(0, 8)}`,
           connection_status: 'online'
         });
 
       this.sendAnnounce('online', 0);
-      await this.flushQueuedMessages(device.userId);
+      await this.flushQueuedMessages(id);
       await this.flushQueuedBroadcasts();
         
         this.emitEvent('onDeviceConnected', device);
@@ -97,20 +99,20 @@ class BridgefyService {
     });
 
     bridgefyEmitter.addListener('onDeviceLost', async (device) => {
-      console.log('📱 Device lost:', device);
-      if (device.userId) {
-        this.connectedDevices.delete(device.userId);
-        this.offlineBlocked.add(device.userId);
+      console.log('Device lost:', device);
+      const id = device?.userId || device?.id;
+      if (id) {
+        this.connectedDevices.delete(id);
+        this.offlineBlocked.add(id);
         
         // Update status in database
-        await databaseService.updateDeviceStatus(device.userId, 'offline');
-        await databaseService.markKnownUsersStaleByViaPeer(device.userId);
+        await databaseService.updateDeviceStatus(id, 'offline');
+        await databaseService.markKnownUsersStaleByViaPeer(id);
         
         this.emitEvent('onDeviceLost', device);
       }
     });
 
-    // Message events
     bridgefyEmitter.addListener('onMessageReceived', async (rawMessage) => {
       console.log('📨 Direct message received:', rawMessage);
       await this.handleIncomingMessage(rawMessage, false);
@@ -127,15 +129,18 @@ class BridgefyService {
     });
 
     bridgefyEmitter.addListener('onDeviceListUpdated', async (data) => {
-      console.log('ðŸ“± Device list updated:', data?.devices?.length);
+      console.log('Device list updated:', data?.devices?.length);
       if (data?.devices && Array.isArray(data.devices)) {
+        this.connectedDevices.clear();
         for (const device of data.devices) {
-          if (device.id && device.name) {
-            this.connectedDevices.set(device.id, device.name);
-            this.offlineBlocked.delete(device.id);
+          const id = device?.userId || device?.id;
+          const name = device?.deviceName || device?.name;
+          if (id) {
+            this.connectedDevices.set(id, name || `Device_${id.substring(0, 8)}`);
+            this.offlineBlocked.delete(id);
             await databaseService.saveDevice({
-              id: device.id,
-              name: device.name,
+              id: id,
+              name: name || `Device_${id.substring(0, 8)}`,
               connection_status: 'online'
             });
           }
@@ -727,12 +732,15 @@ class BridgefyService {
     try {
       const devices = await Bridgefy.getConnectedDevices();
       if (devices && Array.isArray(devices)) {
+        this.connectedDevices.clear();
         for (const device of devices) {
-          if (device.id && device.name) {
-            this.connectedDevices.set(device.id, device.name);
+          const id = device?.userId || device?.id;
+          const name = device?.deviceName || device?.name;
+          if (id) {
+            this.connectedDevices.set(id, name || `Device_${id.substring(0, 8)}`);
             await databaseService.saveDevice({
-              id: device.id,
-              name: device.name,
+              id: id,
+              name: name || `Device_${id.substring(0, 8)}`,
               connection_status: 'online'
             });
           }
