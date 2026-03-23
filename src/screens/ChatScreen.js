@@ -58,6 +58,7 @@ const ChatScreen = ({ route, navigation }) => {
   const [typingUser, setTypingUser]         = useState(null);   // senderName string
   const [showScrollBtn, setShowScrollBtn]   = useState(false);
   const [isDeviceOnline, setIsDeviceOnline] = useState(true);
+  const [isMeshReachable, setIsMeshReachable] = useState(false);
   const [showAttachMenu, setShowAttachMenu] = useState(false);
   const [peerBattery, setPeerBattery]       = useState(null);
   const [msgInfo, setMsgInfo]               = useState(null); // message whose delivery info panel is open
@@ -145,17 +146,35 @@ const ChatScreen = ({ route, navigation }) => {
       }));
     });
 
-    // Track whether the target device is reachable (event-driven, no polling)
-    if (!isBroadcast && deviceId) {
-      BridgefyService.getConnectedDevices().then(list => {
-        if (isMountedRef.current) setIsDeviceOnline(list.some(d => d.id === deviceId));
-      }).catch(() => {});
-    }
+    const refreshReachability = async () => {
+      if (isBroadcast || !deviceId) return;
+      try {
+        const [directList, reachableList] = await Promise.all([
+          BridgefyService.getConnectedDevices(),
+          BridgefyService.getReachableUsers(),
+        ]);
+        const isDirect = directList.some(d => d.id === deviceId);
+        const isReachable = reachableList.some(d => d.id === deviceId);
+        if (isMountedRef.current) {
+          setIsDeviceOnline(isDirect || isReachable);
+          setIsMeshReachable(!isDirect && isReachable);
+        }
+      } catch (_e) {}
+    };
+
+    // Initial reachability check
+    refreshReachability();
     BridgefyService.setDeviceListListener((data) => {
       if (!isMountedRef.current || isBroadcast) return;
-      // Only update online status when we get a real device list (not announce events which have no devices array)
       if (data?.devices && Array.isArray(data.devices)) {
-        setIsDeviceOnline(data.devices.some(d => d.id === deviceId));
+        const isDirect = data.devices.some(d => d.id === deviceId);
+        if (isDirect) {
+          setIsDeviceOnline(true);
+          setIsMeshReachable(false);
+        } else {
+          // Fallback to reachable mesh status
+          refreshReachability();
+        }
       }
       // If this device announced an updated display name or battery, refresh
       if (data?.deviceId === deviceId) {
@@ -165,6 +184,7 @@ const ChatScreen = ({ route, navigation }) => {
       }
     });
 
+
     return () => {
       isMountedRef.current = false;
       BridgefyService.setMessageListener(null);
@@ -172,6 +192,7 @@ const ChatScreen = ({ route, navigation }) => {
       BridgefyService.setDeviceListListener(null);
       BridgefyService.setOnMessageStatusUpdatedHandler(null);
       if (typingTimerRef.current) clearTimeout(typingTimerRef.current);
+      // No polling — rely on device list updates and initial refresh.
     };
   }, [deviceId, deviceName, isBroadcast, navigation]);
 
@@ -448,6 +469,13 @@ const ChatScreen = ({ route, navigation }) => {
             try {
               if (!await requestLocationPermission('Location is required for SOS.')) return;
               setIsSending(true);
+              if (!Geolocation || typeof Geolocation.getCurrentPosition !== 'function') {
+                if (isMountedRef.current) {
+                  setIsSending(false);
+                  Alert.alert('Location unavailable', 'Location service is not available on this device.');
+                }
+                return;
+              }
               Geolocation.getCurrentPosition(
                 async (pos) => {
                   if (!isMountedRef.current) return;
@@ -486,6 +514,13 @@ const ChatScreen = ({ route, navigation }) => {
     try {
       if (!await requestLocationPermission('Location is required to share your position.')) return;
       setIsSending(true);
+      if (!Geolocation || typeof Geolocation.getCurrentPosition !== 'function') {
+        if (isMountedRef.current) {
+          setIsSending(false);
+          Alert.alert('Location unavailable', 'Location service is not available on this device.');
+        }
+        return;
+      }
       Geolocation.getCurrentPosition(
         async (pos) => {
           if (!isMountedRef.current) return;
@@ -547,6 +582,13 @@ const ChatScreen = ({ route, navigation }) => {
     try {
       if (!await requestLocationPermission('Location permission is required to share your location.')) return;
       setIsSending(true);
+      if (!Geolocation || typeof Geolocation.getCurrentPosition !== 'function') {
+        if (isMountedRef.current) {
+          setIsSending(false);
+          Alert.alert('Location unavailable', 'Location service is not available on this device.');
+        }
+        return;
+      }
       Geolocation.getCurrentPosition(
         async (position) => {
           if (!isMountedRef.current) return;
@@ -1022,12 +1064,20 @@ const ChatScreen = ({ route, navigation }) => {
       </Modal>
 
       <SafeAreaView style={styles.safeArea} edges={['top']}>
-        {/* Offline banner — only for direct chats when peer is not reachable */}
+        {/* Offline banner — only when peer is truly not reachable */}
         {!isBroadcast && !isDeviceOnline && (
           <View style={styles.offlineBanner}>
             <Icon name="wifi-off" size={14} color="#856404" style={{ marginRight: 6 }} />
             <Text style={styles.offlineBannerText}>
               {deviceName} is out of range — messages will be queued
+            </Text>
+          </View>
+        )}
+        {!isBroadcast && isDeviceOnline && isMeshReachable && (
+          <View style={styles.meshBanner}>
+            <Icon name="route" size={14} color="#0b5ed7" style={{ marginRight: 6 }} />
+            <Text style={styles.meshBannerText}>
+              Reachable via mesh — messages will hop through nearby devices
             </Text>
           </View>
         )}
@@ -1437,6 +1487,13 @@ const makeStyles = (colors) => StyleSheet.create({
     borderBottomWidth: 1, borderBottomColor: '#ffc107',
   },
   offlineBannerText: { fontSize: 12, color: '#856404', flex: 1 },
+  meshBanner: {
+    flexDirection: 'row', alignItems: 'center',
+    backgroundColor: '#e7f1ff',
+    paddingHorizontal: 14, paddingVertical: 8,
+    borderBottomWidth: 1, borderBottomColor: '#cfe2ff',
+  },
+  meshBannerText: { fontSize: 12, color: '#0b5ed7', flex: 1 },
 
   // ── Scroll-to-bottom FAB ──────────────────────────────────────────────────
   scrollBtn: {

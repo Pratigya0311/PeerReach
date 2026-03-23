@@ -7,6 +7,8 @@ const STORAGE_KEY  = '@peerreach_logs';
 
 const _logs = [];
 let _flushTimer = null;
+const _lastSeen = new Map(); // message -> timestamp (rate limit)
+const RATE_LIMIT_MS = 2000;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -32,6 +34,11 @@ function fmt(args) {
 
 function add(level, args) {
   const entry = `[${ts()}] ${level} ${fmt(args)}`;
+  const key = `${level}:${entry.slice(0, 200)}`;
+  const now = Date.now();
+  const last = _lastSeen.get(key) || 0;
+  if (now - last < RATE_LIMIT_MS) return;
+  _lastSeen.set(key, now);
   _logs.push(entry);
   if (_logs.length > MAX_LOGS) _logs.shift();
   scheduleFlush();

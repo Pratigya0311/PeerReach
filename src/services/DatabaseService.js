@@ -116,13 +116,30 @@ class DatabaseService {
         );
       `);
 
-      // 5. Migrate: add missing columns (check first so no native-level SQL errors logged)
+      // 5. Known users table (multi-hop discovery)
+      await this.db.executeSql(`
+        CREATE TABLE IF NOT EXISTS known_users (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          last_seen INTEGER NOT NULL,
+          hops INTEGER DEFAULT 0,
+          via_peer TEXT,
+          is_online INTEGER DEFAULT 1,
+          created_at INTEGER DEFAULT (strftime('%s', 'now')),
+          updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+        );
+      `);
+
+      // 6. Migrate: add missing columns (check first so no native-level SQL errors logged)
       const [msgCols]    = await this.db.executeSql('PRAGMA table_info(messages);');
       const [devCols]    = await this.db.executeSql('PRAGMA table_info(devices);');
+      const [knownCols]  = await this.db.executeSql('PRAGMA table_info(known_users);');
       const existingMsg  = new Set();
       const existingDev  = new Set();
+      const existingKnown = new Set();
       for (let i = 0; i < msgCols.rows.length; i++) existingMsg.add(msgCols.rows.item(i).name);
       for (let i = 0; i < devCols.rows.length; i++) existingDev.add(devCols.rows.item(i).name);
+      for (let i = 0; i < knownCols.rows.length; i++) existingKnown.add(knownCols.rows.item(i).name);
 
       const msgMigrations = [
         ['is_pinned',   'ALTER TABLE messages ADD COLUMN is_pinned INTEGER DEFAULT 0;'],
@@ -144,13 +161,17 @@ class DatabaseService {
       if (!existingDev.has('battery')) {
         await safeAlter('ALTER TABLE devices ADD COLUMN battery INTEGER;');
       }
+      if (!existingKnown.has('is_online')) {
+        await safeAlter('ALTER TABLE known_users ADD COLUMN is_online INTEGER DEFAULT 1;');
+      }
 
-      // 6. Create indexes for performance
+      // 7. Create indexes for performance
       await this.db.executeSql('CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp DESC);');
       await this.db.executeSql('CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id);');
       await this.db.executeSql('CREATE INDEX IF NOT EXISTS idx_messages_receiver ON messages(receiver_id);');
       await this.db.executeSql('CREATE INDEX IF NOT EXISTS idx_messages_type ON messages(message_type);');
       await this.db.executeSql('CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at DESC);');
+      await this.db.executeSql('CREATE INDEX IF NOT EXISTS idx_known_users_seen ON known_users(last_seen DESC);');
 
       console.log('✅ Database tables created');
 
@@ -329,6 +350,44 @@ class DatabaseService {
       }
     } catch (err) {
       console.warn('updateMessageStatus error:', err);
+    }
+  }
+
+  async getQueuedMessages(receiverId = null) {
+    try {
+      await this.ensureInitialized();
+      let query = `SELECT * FROM messages WHERE delivery_status = 'queued'`;
+      const params = [];
+      if (receiverId) {
+        query += ` AND receiver_id = ?`;
+        params.push(receiverId);
+      }
+      query += ` ORDER BY timestamp ASC;`;
+      const [results] = await this.db.executeSql(query, params);
+      const messages = [];
+      for (let i = 0; i < results.rows.length; i++) {
+        messages.push(this.normalizeMessage(results.rows.item(i)));
+      }
+      return messages;
+    } catch (error) {
+      console.error('Error getting queued messages:', error);
+      throw error;
+    }
+  }
+
+  async getQueuedBroadcastMessages() {
+    try {
+      await this.ensureInitialized();
+      const query = `SELECT * FROM messages WHERE delivery_status = 'queued' AND message_type = 'broadcast' ORDER BY timestamp ASC;`;
+      const [results] = await this.db.executeSql(query);
+      const messages = [];
+      for (let i = 0; i < results.rows.length; i++) {
+        messages.push(this.normalizeMessage(results.rows.item(i)));
+      }
+      return messages;
+    } catch (error) {
+      console.error('Error getting queued broadcast messages:', error);
+      throw error;
     }
   }
 
@@ -567,6 +626,95 @@ class DatabaseService {
       return conversations;
     } catch (error) {
       console.error('❌ Error getting conversations:', error);
+      throw error;
+    }
+  }
+
+  // ============ KNOWN USERS (MULTI-HOP) ============
+
+  async upsertKnownUser(user) {
+    try {
+      await this.ensureInitialized();
+      const {
+        id,
+        name,
+        last_seen = Date.now(),
+        hops = 0,
+        via_peer = null,
+        is_online = 1
+      } = user;
+
+      await this.db.executeSql(
+        `INSERT OR REPLACE INTO known_users 
+         (id, name, last_seen, hops, via_peer, is_online, updated_at) 
+         VALUES (?, ?, ?, ?, ?, ?, strftime('%s', 'now'));`,
+        [id, name, last_seen, hops, via_peer, is_online]
+      );
+
+      return true;
+    } catch (error) {
+      console.error('Error upserting known user:', error);
+      throw error;
+    }
+  }
+
+  async getKnownUsers(minLastSeen = 0, includeOffline = false) {
+    try {
+      await this.ensureInitialized();
+      const query = includeOffline
+        ? `SELECT * FROM known_users WHERE last_seen >= ? ORDER BY last_seen DESC;`
+        : `SELECT * FROM known_users WHERE last_seen >= ? AND is_online = 1 ORDER BY last_seen DESC;`;
+      const [results] = await this.db.executeSql(query, [minLastSeen]);
+
+      const users = [];
+      for (let i = 0; i < results.rows.length; i++) {
+        users.push(results.rows.item(i));
+      }
+      return users;
+    } catch (error) {
+      console.error('Error getting known users:', error);
+      throw error;
+    }
+  }
+
+  async getKnownUser(userId) {
+    try {
+      await this.ensureInitialized();
+      const [results] = await this.db.executeSql(
+        'SELECT * FROM known_users WHERE id = ? LIMIT 1;',
+        [userId]
+      );
+      return results.rows.item(0) || null;
+    } catch (error) {
+      console.error('Error getting known user:', error);
+      throw error;
+    }
+  }
+
+  async pruneKnownUsers(expireBefore) {
+    try {
+      await this.ensureInitialized();
+      await this.db.executeSql(
+        `DELETE FROM known_users WHERE last_seen < ?;`,
+        [expireBefore]
+      );
+      return true;
+    } catch (error) {
+      console.error('Error pruning known users:', error);
+      throw error;
+    }
+  }
+
+  async markKnownUsersStaleByViaPeer(viaPeerId) {
+    try {
+      await this.ensureInitialized();
+      await this.db.executeSql(
+        `UPDATE known_users SET is_online = 0, updated_at = strftime('%s', 'now') WHERE via_peer = ?;`,
+        [viaPeerId]
+      );
+      return true;
+    } catch (error) {
+      console.error('Error marking known users stale:', error);
       throw error;
     }
   }

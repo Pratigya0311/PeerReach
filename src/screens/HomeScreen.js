@@ -17,12 +17,15 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect } from '@react-navigation/native';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 import MCIcon from 'react-native-vector-icons/MaterialCommunityIcons';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import NetInfo from '@react-native-community/netinfo';
 import BridgefyService from '../services/BridgefyService';
 import weatherService, { wmoInfo } from '../services/WeatherService';
 import { useTheme } from '../theme';
 import { formatTimeAgo } from '../utils/timeFormat';
 import { requestBridgefyPermissions } from '../utils/permissions';
 import LoadingScreen from '../components/LoadingScreen';
+import { BRIDGEFY_EVER_INIT_KEY } from '../constants/storageKeys';
 
 const SEARCH_DEBOUNCE_MS = 300;
 
@@ -53,6 +56,9 @@ const HomeScreen = ({ navigation }) => {
   const navTimerRef     = useRef(null);
   const infoIntervalRef = useRef(null);   // nearby peers — every 2 min
   const batteryTimerRef = useRef(null);   // battery — every 5 min
+  const internetPollRef = useRef(null);
+  const btPollRef = useRef(null);
+  const shownAlertRef = useRef({ internet: false, bluetooth: false });
 
 
 
@@ -76,12 +82,13 @@ const HomeScreen = ({ navigation }) => {
     BridgefyService.setOnReadyHandler(handleBridgefyReady);
     BridgefyService.setOnErrorHandler(handleBridgefyError);
     BridgefyService.setOnUnreadUpdatedHandler(handleUnreadUpdated);
+    BridgefyService.setOnBluetoothStateChangedHandler(handleBluetoothChanged);
     // Refresh conversation names when a device announces their display name
     BridgefyService.setOnDeviceListUpdatedHandler(() => loadData().catch(console.error));
 
     requestPermissions().then((granted) => {
       if (granted) {
-        initializeBridgefy();
+        ensureConnectivityThenInit();
       } else {
         setIsLoading(false);
         Alert.alert(
@@ -100,6 +107,7 @@ const HomeScreen = ({ navigation }) => {
       BridgefyService.setOnReadyHandler(null);
       BridgefyService.setOnErrorHandler(null);
       BridgefyService.setOnUnreadUpdatedHandler(null);
+      BridgefyService.setOnBluetoothStateChangedHandler(null);
       BridgefyService.setOnDeviceListUpdatedHandler(null);
       weatherService.setOnWeatherUpdated(null);
       BridgefyService.setOnLocationUpdated(null);
@@ -107,6 +115,8 @@ const HomeScreen = ({ navigation }) => {
       if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
       if (navTimerRef.current) clearTimeout(navTimerRef.current);
       if (infoIntervalRef.current) clearInterval(infoIntervalRef.current);
+      if (internetPollRef.current) clearInterval(internetPollRef.current);
+      if (btPollRef.current) clearInterval(btPollRef.current);
     };
   }, []);
 
@@ -155,6 +165,60 @@ const HomeScreen = ({ navigation }) => {
     }
   };
 
+  const ensureConnectivityThenInit = async () => {
+    try {
+      const ever = await AsyncStorage.getItem(BRIDGEFY_EVER_INIT_KEY);
+      if (!ever) {
+        const net = await NetInfo.fetch();
+        if (!net.isConnected) {
+          setBridgefyStatus('waiting_internet');
+          setIsLoading(true);
+          if (!shownAlertRef.current.internet) {
+            shownAlertRef.current.internet = true;
+            Alert.alert('No Internet', 'Internet is required only for first-time initialization. We will auto-start when it is back.');
+          }
+          if (!internetPollRef.current) {
+            internetPollRef.current = setInterval(async () => {
+              const state = await NetInfo.fetch();
+              if (state.isConnected) {
+                clearInterval(internetPollRef.current);
+                internetPollRef.current = null;
+                ensureConnectivityThenInit();
+              }
+            }, 5000);
+          }
+          return;
+        }
+      }
+
+      const btEnabled = await BridgefyService.getBluetoothState();
+      if (!btEnabled) {
+        setBridgefyStatus('waiting_bluetooth');
+        setIsLoading(true);
+        if (!shownAlertRef.current.bluetooth) {
+          shownAlertRef.current.bluetooth = true;
+          Alert.alert('Bluetooth Off', 'Please turn on Bluetooth. PeerReach will auto-start when it is enabled.');
+        }
+        if (!btPollRef.current) {
+          btPollRef.current = setInterval(async () => {
+            const enabled = await BridgefyService.getBluetoothState();
+            if (enabled) {
+              clearInterval(btPollRef.current);
+              btPollRef.current = null;
+              ensureConnectivityThenInit();
+            }
+          }, 5000);
+        }
+        return;
+      }
+
+      initializeBridgefy();
+    } catch (err) {
+      console.error('ensureConnectivityThenInit error:', err);
+      initializeBridgefy();
+    }
+  };
+
   const loadData = async () => {
     try {
       setRefreshing(true);
@@ -179,6 +243,7 @@ const HomeScreen = ({ navigation }) => {
     setMyDeviceName(data.deviceName);
     setBridgefyStatus('ready');
     setIsLoading(false);
+    AsyncStorage.setItem(BRIDGEFY_EVER_INIT_KEY, '1').catch(() => {});
     loadData().catch(err => console.error('Error loading data on ready:', err));
     // Show cached weather immediately, then get live updates via WeatherService
     const cached = weatherService.getData();
@@ -221,6 +286,22 @@ const HomeScreen = ({ navigation }) => {
           { text: 'Dismiss', style: 'cancel' },
         ]
       );
+    }
+  };
+
+  const handleBluetoothChanged = (data) => {
+    const enabled = data?.enabled !== false;
+    if (!enabled) {
+      setBridgefyStatus('waiting_bluetooth');
+      setIsLoading(true);
+      if (!shownAlertRef.current.bluetooth) {
+        shownAlertRef.current.bluetooth = true;
+        Alert.alert('Bluetooth Off', 'Please turn on Bluetooth. PeerReach will auto-start when it is enabled.');
+      }
+      return;
+    }
+    if (bridgefyStatus !== 'ready') {
+      ensureConnectivityThenInit();
     }
   };
   const handleUnreadUpdated  = (counts) => setUnreadCounts(counts);
@@ -410,7 +491,14 @@ const HomeScreen = ({ navigation }) => {
 
   // ─── Loading state ────────────────────────────────────────────────────────
   if (isLoading) {
-    const sub = bridgefyStatus === 'error' ? 'Failed to start. Please check permissions.' : 'Initializing mesh network...';
+    const sub =
+      bridgefyStatus === 'waiting_internet'
+        ? 'Waiting for internet (first-time setup)...'
+        : bridgefyStatus === 'waiting_bluetooth'
+        ? 'Waiting for Bluetooth...'
+        : bridgefyStatus === 'error'
+        ? 'Failed to start. Please check permissions.'
+        : 'Initializing mesh network...';
     return <LoadingScreen message="Starting PeerReach..." subMessage={sub} />;
   }
 

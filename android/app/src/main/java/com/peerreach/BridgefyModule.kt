@@ -2,6 +2,10 @@ package com.peerreach
 
 import android.content.Context
 import android.util.Log
+import android.bluetooth.BluetoothAdapter
+import android.content.BroadcastReceiver
+import android.content.Intent
+import android.content.IntentFilter
 import com.facebook.react.bridge.*
 import com.facebook.react.modules.core.DeviceEventManagerModule
 import org.json.JSONObject
@@ -22,6 +26,23 @@ class BridgefyModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
     private var isStarting: Boolean = false
     private var deviceName: String = "Unknown Device"
     private var connectedDevices = mutableMapOf<UUID, String>()
+    private var bluetoothReceiver: BroadcastReceiver? = null
+
+    init {
+        if (bluetoothReceiver == null) {
+            bluetoothReceiver = object : BroadcastReceiver() {
+                override fun onReceive(context: Context?, intent: Intent?) {
+                    if (intent?.action == BluetoothAdapter.ACTION_STATE_CHANGED) {
+                        val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
+                        val enabled = state == BluetoothAdapter.STATE_ON
+                        emitBluetoothState(enabled)
+                    }
+                }
+            }
+            val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
+            reactApplicationContext.registerReceiver(bluetoothReceiver, filter)
+        }
+    }
 
     override fun getName(): String {
         return "Bridgefy"
@@ -43,6 +64,32 @@ class BridgefyModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
         }
     }
 
+    private fun emitBluetoothState(enabled: Boolean) {
+        val params = Arguments.createMap()
+        params.putBoolean("enabled", enabled)
+        sendEvent("onBluetoothStateChanged", params)
+    }
+
+    override fun onCatalystInstanceDestroy() {
+        super.onCatalystInstanceDestroy()
+        try {
+            if (bluetoothReceiver != null) {
+                reactApplicationContext.unregisterReceiver(bluetoothReceiver)
+                bluetoothReceiver = null
+            }
+        } catch (_e: Exception) { }
+    }
+
+    @ReactMethod
+    fun getBluetoothState(promise: Promise) {
+        try {
+            val adapter = BluetoothAdapter.getDefaultAdapter()
+            promise.resolve(adapter != null && adapter.isEnabled)
+        } catch (e: Exception) {
+            promise.resolve(false)
+        }
+    }
+
     private fun parseMessageData(data: ByteArray): Map<String, Any> {
         return try {
             val jsonString = String(data, Charsets.UTF_8)
@@ -57,6 +104,21 @@ class BridgefyModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
             map
         } catch (e: Exception) {
             mapOf("text" to String(data, Charsets.UTF_8))
+        }
+    }
+
+    private fun addExtraParams(messageData: Map<String, Any>, params: WritableMap) {
+        val keys = listOf("announceId", "userId", "userName", "status", "hop", "ts", "targetId")
+        for (key in keys) {
+            val value = messageData[key] ?: continue
+            when (value) {
+                is String -> params.putString(key, value)
+                is Int -> params.putInt(key, value)
+                is Long -> params.putDouble(key, value.toDouble())
+                is Double -> params.putDouble(key, value)
+                is Boolean -> params.putBoolean(key, value)
+                else -> params.putString(key, value.toString())
+            }
         }
     }
 
@@ -131,6 +193,8 @@ class BridgefyModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
                         Log.w("BridgefyModule", "Invalid sender ID in message: $senderId")
                     }
                 }
+
+                addExtraParams(messageData, params)
 
                 val isBroadcast = transmissionMode is TransmissionMode.Broadcast
                 params.putBoolean("isBroadcast", isBroadcast)
@@ -352,6 +416,48 @@ class BridgefyModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
     }
 
     @ReactMethod
+    fun sendMeshMessage(receiverId: String, text: String, promise: Promise) {
+        val userId = currentUserId
+        if (userId == null) {
+            promise.reject("USER_NOT_INITIALIZED", "User not initialized yet")
+            return
+        }
+        val b = bridgefy
+        if (b == null) {
+            promise.reject("NOT_INITIALIZED", "Bridgefy not initialized")
+            return
+        }
+        try {
+            val receiverUUID = UUID.fromString(receiverId)
+            val messageObject = mapOf(
+                "type" to "text",
+                "text" to text,
+                "senderId" to userId.toString(),
+                "senderName" to deviceName,
+                "timestamp" to System.currentTimeMillis(),
+                "isBroadcast" to false
+            )
+            val jsonString = JSONObject(messageObject).toString()
+            val bytes = jsonString.toByteArray(Charsets.UTF_8)
+            b.send(bytes, TransmissionMode.Mesh(receiverUUID))
+            val result = Arguments.createMap()
+            result.putString("id", UUID.randomUUID().toString())
+            result.putString("text", text)
+            result.putString("senderId", userId.toString())
+            result.putString("senderName", deviceName)
+            result.putString("receiverId", receiverId)
+            result.putString("timestamp", System.currentTimeMillis().toString())
+            result.putBoolean("isMine", true)
+            result.putBoolean("isBroadcast", false)
+            promise.resolve(result)
+        } catch (e: IllegalArgumentException) {
+            promise.reject("INVALID_RECEIVER_ID", "Invalid receiver ID format")
+        } catch (e: Exception) {
+            promise.reject("SEND_ERROR", e.message ?: "Failed to send mesh message")
+        }
+    }
+
+    @ReactMethod
     fun sendBroadcast(text: String, promise: Promise) {
         val userId = currentUserId
         if (userId == null) {
@@ -422,7 +528,17 @@ class BridgefyModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
             return
         }
         try {
-            val bytes = payload.toByteArray(Charsets.UTF_8)
+            val jsonObject = JSONObject(payload)
+            if (!jsonObject.has("senderId")) {
+                jsonObject.put("senderId", userId.toString())
+            }
+            if (!jsonObject.has("senderName")) {
+                jsonObject.put("senderName", deviceName)
+            }
+            if (!jsonObject.has("timestamp")) {
+                jsonObject.put("timestamp", System.currentTimeMillis())
+            }
+            val bytes = jsonObject.toString().toByteArray(Charsets.UTF_8)
             b.send(bytes, TransmissionMode.Broadcast(userId))
             val result = Arguments.createMap()
             result.putString("id", UUID.randomUUID().toString())

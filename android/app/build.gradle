@@ -165,4 +165,9 @@ dependencies {
     implementation project(':react-native-sqlite-storage')
 }
 
-apply from: "../../node_modules/react-native-vector-icons/fonts.gradle"
+def vectorIconsFonts = file("../../node_modules/react-native-vector-icons/fonts.gradle")
+if (vectorIconsFonts.exists()) {
+    apply from: vectorIconsFonts
+} else {
+    logger.lifecycle("react-native-vector-icons fonts.gradle not found; skipping font autolink")
+}

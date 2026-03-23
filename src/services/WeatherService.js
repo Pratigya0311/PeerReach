@@ -243,6 +243,10 @@ class WeatherService {
   _getCoords() {
     return new Promise((resolve) => {
       try {
+        if (!Geolocation || typeof Geolocation.getCurrentPosition !== 'function') {
+          resolve(null);
+          return;
+        }
         Geolocation.getCurrentPosition(
           (pos) => resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
           ()    => resolve(null),

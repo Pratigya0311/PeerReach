@@ -1,12 +1,13 @@
-// src/services/GatewayService.js
+﻿// src/services/GatewayService.js
 // Crowdsourced Opportunistic Internet Gateway over BLE Mesh
+import { GROQ_API_KEY } from '@env';
 import databaseService from './DatabaseService';
 
-// ── Groq API key ──────────────────────────────────────────────────────────────
+// â”€â”€ Groq API key â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Get your key from https://console.groq.com/ and replace the placeholder below.
-const GROQ_API_KEY = '';
 
-// Android's own connectivity check endpoint — always returns exactly 204, never redirects to captive portal pages
+
+// Android's own connectivity check endpoint â€” always returns exactly 204, never redirects to captive portal pages
 const CONNECTIVITY_URLS = [
   'https://connectivitycheck.gstatic.com/generate_204',
   'https://www.google.com/generate_204',
@@ -27,15 +28,15 @@ const RETRY_INTERVAL_MS = 30 * 1000;   // retry queued requests every 30s
 
 class GatewayService {
   constructor() {
-    this.seenMessages = new Map();     // id → timestamp (dedup)
-    this.pendingRequests = new Map();  // requestId → { resolve, reject, query, timer }
+    this.seenMessages = new Map();     // id â†’ timestamp (dedup)
+    this.pendingRequests = new Map();  // requestId â†’ { resolve, reject, query, timer }
     this.pendingQueue = [];            // store-and-forward: requests waiting for internet
     this.myDeviceId = null;
     this.bridgefyService = null;       // injected via init()
     this.onQueryResultCallback = null; // called when a response arrives
     this.retryTimer = null;
 
-    // Internet check cache — avoid hammering the network on every relay packet
+    // Internet check cache â€” avoid hammering the network on every relay packet
     this._internetCheckResult = false;
     this._internetCheckTime   = 0;
 
@@ -56,15 +57,15 @@ class GatewayService {
     this.onQueryResultCallback = cb;
   }
 
-  // ── Internet connectivity check ─────────────────────────────────────────────
+  // â”€â”€ Internet connectivity check â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   async checkInternet() {
-    // Return cached result if fresh — prevents hammering the network on every incoming relay packet
+    // Return cached result if fresh â€” prevents hammering the network on every incoming relay packet
     if (Date.now() - this._internetCheckTime < 10000) {
       return this._internetCheckResult;
     }
 
-    // Try each URL in order — first 204 response wins.
+    // Try each URL in order â€” first 204 response wins.
     // Strictly checking status === 204 prevents captive portal login pages (which return 200) from
     // being mistaken for real internet connectivity.
     let result = false;
@@ -74,23 +75,23 @@ class GatewayService {
         const timeout = setTimeout(() => controller.abort(), 4000);
         try {
           const res = await fetch(url, { method: 'HEAD', signal: controller.signal });
-          console.log('[Gateway] checkInternet →', url, 'status:', res.status);
+          console.log('[Gateway] checkInternet â†’', url, 'status:', res.status);
           if (res.status === 204) { result = true; break; }
         } finally {
           clearTimeout(timeout);
         }
       } catch (_e) {
-        // This URL failed — try the next one
+        // This URL failed â€” try the next one
       }
     }
 
     this._internetCheckResult = result;
     this._internetCheckTime   = Date.now();
-    console.log('[Gateway] checkInternet → cached result:', result);
+    console.log('[Gateway] checkInternet â†’ cached result:', result);
     return result;
   }
 
-  // ── Query type detection ────────────────────────────────────────────────────
+  // â”€â”€ Query type detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   _isWeatherQuery(query) {
     return /\b(weather|forecast|temperature|temp|rain|sunny|cloudy|humid|wind|climate|hot|cold)\b/i.test(query);
@@ -106,7 +107,7 @@ class GatewayService {
       .replace(/\s+/g, ' ') || 'auto';
   }
 
-  // ── Query normalization for cache key ───────────────────────────────────────
+  // â”€â”€ Query normalization for cache key â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   // Strips stop words and punctuation so "what is the capital of France" and
   // "capital france" both hit the same cache entry.
 
@@ -120,7 +121,7 @@ class GatewayService {
       .trim();
   }
 
-  // ── Individual API fetchers ─────────────────────────────────────────────────
+  // â”€â”€ Individual API fetchers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   _makeSignal(ms) {
     // AbortSignal.timeout() is the clean built-in (no timer to leak).
@@ -143,8 +144,8 @@ class GatewayService {
 
   _toKeywords(query) {
     // Strip question prefixes and filler words to get the core topic noun phrase.
-    // "how to survive in mountains" → "survive mountains"
-    // "what is the capital of france" → "capital france"
+    // "how to survive in mountains" â†’ "survive mountains"
+    // "what is the capital of france" â†’ "capital france"
     return query
       .replace(/^(how (do|does|to|can|should|would)|what (is|are|was|were|does)|who (is|was|are)|where (is|are)|when (did|is|was)|why (does|is|did)|explain|define|tell me about)\s+/i, '')
       .replace(/\b(the|a|an|in|on|at|of|for|to|from|with|by|about|and|or|do|does|did|is|are|was|were|be|being|been|i|you|we|they|he|she|it|its|my|your)\b/gi, ' ')
@@ -178,7 +179,7 @@ class GatewayService {
   }
 
   async _wikiFullTextSearch(query) {
-    // Full-text search — finds articles that MENTION the query, not just title matches.
+    // Full-text search â€” finds articles that MENTION the query, not just title matches.
     const res = await fetch(
       `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&srlimit=1&format=json`,
       { signal: this._makeSignal(10000), headers: this._headers }
@@ -206,10 +207,10 @@ class GatewayService {
       if (!title) throw new Error('No Wikipedia article found');
 
       const extract = await this._wikiSummary(title);
-      console.log('📖 Wikipedia answer from:', title);
+      console.log('ðŸ“– Wikipedia answer from:', title);
       return extract;
     } catch (e) {
-      console.log('❌ Wikipedia failed:', e.message);
+      console.log('âŒ Wikipedia failed:', e.message);
       throw e;
     }
   }
@@ -218,7 +219,7 @@ class GatewayService {
     console.log('[Groq] Starting request for query:', query);
 
     if (!GROQ_API_KEY || GROQ_API_KEY === '') {
-      console.error('[Groq] ❌ API key is missing or not configured');
+      console.error('[Groq] âŒ API key is missing or not configured');
       throw new Error('Groq API key not configured');
     }
     console.log('[Groq] API key present, length:', GROQ_API_KEY.length, 'prefix:', GROQ_API_KEY.substring(0, 6));
@@ -249,11 +250,11 @@ class GatewayService {
         body: JSON.stringify(requestBody),
       });
     } catch (fetchErr) {
-      // AbortError = timeout — fall through to Wikipedia silently
+      // AbortError = timeout â€” fall through to Wikipedia silently
       if (fetchErr.name === 'AbortError') {
-        console.warn('[Groq] ⏱ Request timed out, falling back to Wikipedia');
+        console.warn('[Groq] â± Request timed out, falling back to Wikipedia');
       } else {
-        console.warn('[Groq] ⚠️ Network error:', fetchErr.message);
+        console.warn('[Groq] âš ï¸ Network error:', fetchErr.message);
       }
       throw fetchErr;
     }
@@ -262,7 +263,7 @@ class GatewayService {
 
     if (!res.ok) {
       const errBody = await res.text().catch(() => '(could not read body)');
-      console.error('[Groq] ❌ Non-OK response. Status:', res.status, '| Body:', errBody.substring(0, 300));
+      console.error('[Groq] âŒ Non-OK response. Status:', res.status, '| Body:', errBody.substring(0, 300));
       throw new Error(`Groq ${res.status}: ${errBody.substring(0, 80)}`);
     }
 
@@ -270,26 +271,26 @@ class GatewayService {
     try {
       json = await res.json();
     } catch (parseErr) {
-      console.error('[Groq] ❌ Failed to parse JSON response:', parseErr.message);
+      console.error('[Groq] âŒ Failed to parse JSON response:', parseErr.message);
       throw parseErr;
     }
 
-    console.log('[Groq] Response structure — choices:', json?.choices?.length, '| finish_reason:', json?.choices?.[0]?.finish_reason);
+    console.log('[Groq] Response structure â€” choices:', json?.choices?.length, '| finish_reason:', json?.choices?.[0]?.finish_reason);
 
     const content = json?.choices?.[0]?.message?.content?.trim();
     if (!content || content.length < 5) {
-      console.error('[Groq] ❌ Empty or too-short content. Full response:', JSON.stringify(json).substring(0, 300));
+      console.error('[Groq] âŒ Empty or too-short content. Full response:', JSON.stringify(json).substring(0, 300));
       throw new Error('Empty Groq response');
     }
 
-    console.log('[Groq] ✅ Got answer, length:', content.length);
+    console.log('[Groq] âœ… Got answer, length:', content.length);
     return content.length > 800 ? content.substring(0, 797) + '...' : content;
   }
 
   async _fetchWeather(location) {
     // wttr.in returns a single compact line e.g. "Bangalore: +28C"
-    // format=3 is the shortest format — well within BLE payload limits.
-    // No location (or 'auto') → omit the path segment so wttr.in uses IP-based detection.
+    // format=3 is the shortest format â€” well within BLE payload limits.
+    // No location (or 'auto') â†’ omit the path segment so wttr.in uses IP-based detection.
     const weatherUrl =
       location && location !== 'auto'
         ? `https://wttr.in/${encodeURIComponent(location)}?format=3`
@@ -304,58 +305,58 @@ class GatewayService {
       if (!text || text.includes('Unknown location')) throw new Error('Unknown location');
       return text;
     } catch (e) {
-      console.log('❌ Weather failed:', e.message);
+      console.log('âŒ Weather failed:', e.message);
       throw e;
     }
   }
 
-  // ── Query execution ─────────────────────────────────────────────────────────
+  // â”€â”€ Query execution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   async executeQuery(query) {
     const normalizedKey = this._normalizeQuery(query);
-    console.log('[Gateway] executeQuery — raw:', query, '| normalized key:', normalizedKey);
+    console.log('[Gateway] executeQuery â€” raw:', query, '| normalized key:', normalizedKey);
 
     // Cache-first (use normalized key)
     const cached = await this._getCached(normalizedKey);
     if (cached) {
-      console.log('[Gateway] 💾 Cache hit for:', query);
+      console.log('[Gateway] ðŸ’¾ Cache hit for:', query);
       return { result: cached, source: 'cache' };
     }
     console.log('[Gateway] No cache hit, fetching live...');
 
     let result = null;
 
-    // Weather queries → wttr.in only (Groq/Wikipedia have stale weather data — don't use them)
+    // Weather queries â†’ wttr.in only (Groq/Wikipedia have stale weather data â€” don't use them)
     if (this._isWeatherQuery(query)) {
       const location = this._extractLocation(query);
       console.log('[Gateway] Weather query detected, location:', location);
       try {
         result = await this._fetchWeather(location);
-        console.log('[Gateway] 🌤️ Weather answer:', result);
+        console.log('[Gateway] ðŸŒ¤ï¸ Weather answer:', result);
       } catch (weatherErr) {
-        console.warn('[Gateway] ⚠️ Weather fetch failed:', weatherErr.message);
+        console.warn('[Gateway] âš ï¸ Weather fetch failed:', weatherErr.message);
         result = 'Weather information is currently unavailable. Try again later.';
       }
     }
 
-    // General queries: Groq → Wikipedia (in priority order; skipped for weather)
+    // General queries: Groq â†’ Wikipedia (in priority order; skipped for weather)
     if (!result) {
       console.log('[Gateway] Trying Groq...');
       try {
         result = await this._fetchGroq(query);
-        console.log('[Gateway] 🤖 Groq answer obtained');
+        console.log('[Gateway] ðŸ¤– Groq answer obtained');
       } catch (groqErr) {
-        console.warn('[Gateway] ⚠️ Groq unavailable:', groqErr.message);
+        console.warn('[Gateway] âš ï¸ Groq unavailable:', groqErr.message);
       }
     }
 
     if (!result) {
-      console.log('[Gateway] Groq failed or skipped — trying Wikipedia...');
+      console.log('[Gateway] Groq failed or skipped â€” trying Wikipedia...');
       try {
         result = await this._fetchWikipedia(query);
-        console.log('[Gateway] 📖 Wikipedia answer obtained');
+        console.log('[Gateway] ðŸ“– Wikipedia answer obtained');
       } catch (wikiErr) {
-        console.warn('[Gateway] ⚠️ Wikipedia failed:', wikiErr.message);
+        console.warn('[Gateway] âš ï¸ Wikipedia failed:', wikiErr.message);
       }
     }
 
@@ -368,7 +369,7 @@ class GatewayService {
       result = result.substring(0, 797) + '...';
     }
 
-    // Only cache and share real answers — don't persist the "no result" fallback string
+    // Only cache and share real answers â€” don't persist the "no result" fallback string
     // so future requests still try the network instead of returning a cached error.
     const isFallback = result.startsWith('No answer found for');
     if (!isFallback) {
@@ -380,31 +381,31 @@ class GatewayService {
     return { result, source: 'internet' };
   }
 
-  // ── Public: send a query (called from MeshQueryScreen) ─────────────────────
+  // â”€â”€ Public: send a query (called from MeshQueryScreen) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-  // onStatus(hasInternet: bool) — called once connectivity is known, before waiting for result.
+  // onStatus(hasInternet: bool) â€” called once connectivity is known, before waiting for result.
   // This lets the screen update its loading label without doing a second checkInternet() call.
   async sendQuery(query, onStatus) {
     if (!this.bridgefyService) {
-      throw new Error('Mesh not ready — please wait for Bridgefy to initialize');
+      throw new Error('Mesh not ready â€” please wait for Bridgefy to initialize');
     }
 
     const hasInternet = await this.checkInternet();
     if (onStatus) onStatus(hasInternet);
 
     if (hasInternet) {
-      // I have internet — answer locally, no mesh needed
+      // I have internet â€” answer locally, no mesh needed
       const { result, source } = await this.executeQuery(query);
       return { result, source, hops: 0 };
     }
 
-    // No internet — broadcast request through the mesh
+    // No internet â€” broadcast request through the mesh
     return new Promise((resolve, reject) => {
       const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
       const timer = setTimeout(() => {
         this.pendingRequests.delete(requestId);
-        // Store for later (store-and-forward) — cap at 10, evict oldest
+        // Store for later (store-and-forward) â€” cap at 10, evict oldest
         if (this.pendingQueue.length >= 10) {
           this.pendingQueue.sort((a, b) => a.timestamp - b.timestamp);
           this.pendingQueue.shift();
@@ -434,7 +435,7 @@ class GatewayService {
     });
   }
 
-  // ── Called by BridgefyService when a gateway-type message arrives ───────────
+  // â”€â”€ Called by BridgefyService when a gateway-type message arrives â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   async handleIncomingGatewayMessage(parsed, _senderId) {
     if (parsed.type === 'internet_request') {
@@ -446,7 +447,7 @@ class GatewayService {
     }
   }
 
-  // ── Internal: handle an internet_request packet ─────────────────────────────
+  // â”€â”€ Internal: handle an internet_request packet â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   async _handleRequest(message) {
     const { request_id, source, query, ttl, timestamp } = message;
@@ -461,20 +462,20 @@ class GatewayService {
     // Don't relay my own broadcasts back to myself
     if (source === this.myDeviceId) return;
 
-    // Answer from cache — no internet needed
+    // Answer from cache â€” no internet needed
     const normalizedKey = this._normalizeQuery(query);
     const cached = await this._getCached(normalizedKey);
     if (cached) {
-      console.log('💾 Answering from cache for peer:', query);
+      console.log('ðŸ’¾ Answering from cache for peer:', query);
       this._sendResponse(request_id, source, cached, ttl);
       return;
     }
 
-    // I have internet — act as gateway
+    // I have internet â€” act as gateway
     const hasInternet = await this.checkInternet();
     if (hasInternet) {
       try {
-        console.log('🌐 Acting as gateway for peer query:', query);
+        console.log('ðŸŒ Acting as gateway for peer query:', query);
         const { result } = await this.executeQuery(query);
         this._sendResponse(request_id, source, result, ttl);
       } catch (e) {
@@ -483,14 +484,14 @@ class GatewayService {
       return;
     }
 
-    // No internet and no cache — relay with TTL decrement (Spray-and-Wait)
+    // No internet and no cache â€” relay with TTL decrement (Spray-and-Wait)
     if (ttl > 1) {
       const relay = { ...message, ttl: ttl - 1 };
       this.bridgefyService.sendBroadcast(JSON.stringify(relay)).catch(() => {});
     }
   }
 
-  // ── Internal: handle an internet_response packet ────────────────────────────
+  // â”€â”€ Internal: handle an internet_response packet â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   _handleResponse(message) {
     const { request_id, destination, result } = message;
@@ -524,8 +525,8 @@ class GatewayService {
     }
 
     // Notify screen via callback (handles the case where promise already timed out).
-    // delayed=true when the 30s promise already rejected — screen must surface this as an async result.
-    // delayed=false when the promise is still live — screen gets the result via the resolved promise,
+    // delayed=true when the 30s promise already rejected â€” screen must surface this as an async result.
+    // delayed=false when the promise is still live â€” screen gets the result via the resolved promise,
     // so the callback is informational only and the screen should ignore it.
     if (this.onQueryResultCallback) {
       this.onQueryResultCallback({ request_id, result, query: queryText, delayed: !pending });
@@ -542,11 +543,11 @@ class GatewayService {
       ttl_remaining: ttlRemaining,
       timestamp: Date.now(),
     };
-    // Direct delivery — don't broadcast query results to every nearby device (privacy)
+    // Direct delivery â€” don't broadcast query results to every nearby device (privacy)
     this.bridgefyService.sendDirectProtocol(destination, JSON.stringify(packet)).catch(() => {});
   }
 
-  // ── Mesh cache sharing ──────────────────────────────────────────────────────
+  // â”€â”€ Mesh cache sharing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   // When this device fetches a fresh answer from the internet it broadcasts
   // the result to all nearby nodes. Any node that hears the share stores it
   // locally so future requests can be answered without reaching out again.
@@ -574,15 +575,15 @@ class GatewayService {
     if (this._seen(dedupKey)) return;
     this._markSeen(dedupKey);
 
-    // Ignore stale shares (older than 30 minutes — same as cache TTL)
+    // Ignore stale shares (older than 30 minutes â€” same as cache TTL)
     if (Date.now() - timestamp > MAX_CACHE_AGE_MS) return;
 
     // Save to our own cache so we can answer future requests
     await this._saveCache(query, result);
-    console.log('📡 Cached from mesh share:', query);
+    console.log('ðŸ“¡ Cached from mesh share:', query);
   }
 
-  // ── Store-and-Forward retry loop ────────────────────────────────────────────
+  // â”€â”€ Store-and-Forward retry loop â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   _startRetryTimer() {
     this.retryTimer = setInterval(async () => {
@@ -612,7 +613,7 @@ class GatewayService {
             });
           }
         } catch (_e) {
-          // Still failing — put back, but respect the cap
+          // Still failing â€” put back, but respect the cap
           if (this.pendingQueue.length < 10) {
             this.pendingQueue.push(item);
           }
@@ -621,7 +622,7 @@ class GatewayService {
     }, RETRY_INTERVAL_MS);
   }
 
-  // ── Deduplication helpers ───────────────────────────────────────────────────
+  // â”€â”€ Deduplication helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   _seen(id) {
     return this.seenMessages.has(id);
@@ -642,7 +643,7 @@ class GatewayService {
     }
   }
 
-  // ── Cache helpers (SQLite via DatabaseService) ──────────────────────────────
+  // â”€â”€ Cache helpers (SQLite via DatabaseService) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   async _getCached(query) {
     try {
@@ -663,7 +664,7 @@ class GatewayService {
         [query.toLowerCase().trim(), result, Date.now()]
       );
     } catch (_e) {
-      // Non-critical — ignore
+      // Non-critical â€” ignore
     }
   }
 

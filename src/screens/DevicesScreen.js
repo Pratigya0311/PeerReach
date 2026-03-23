@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useMemo } from 'react';
+import React, { useState, useCallback, useMemo, useEffect, useRef } from 'react';
 import {
   View,
   Text,
@@ -17,32 +17,90 @@ const DevicesScreen = ({ navigation }) => {
   const colors = useTheme();
   const styles = useMemo(() => makeStyles(colors), [colors]);
 
-  const [devices, setDevices]       = useState([]);
+  const [nearby, setNearby]         = useState([]);
+  const [reachable, setReachable]   = useState([]);
   const [refreshing, setRefreshing] = useState(false);
+  const [scanHealth, setScanHealth] = useState(BridgefyService.getScanHealth?.() || {});
 
-  useFocusEffect(
-    useCallback(() => {
-      loadDevices();
-      BridgefyService.setOnDeviceListUpdatedHandler(() => loadDevices());
-      return () => BridgefyService.setOnDeviceListUpdatedHandler(null);
-    }, [])
-  );
+  const loadTimerRef = useRef(null);
+  const loadingRef = useRef(false);
+  const pendingRef = useRef(false);
+  const scanIntervalRef = useRef(null);
 
-  const loadDevices = async () => {
+  const loadDevices = useCallback(async () => {
     try {
-      const [deviceList, myId] = await Promise.all([
+      const [deviceList, reachableList, myId] = await Promise.all([
         BridgefyService.getConnectedDevices(),
+        BridgefyService.getReachableUsers(),
         BridgefyService.getMyDeviceId(),
       ]);
-      setDevices(deviceList.filter(d => d.id !== myId));
+      const direct = deviceList.filter(d => d.id !== myId);
+      const directIds = new Set(direct.map(d => d.id));
+      const meshOnly = (reachableList || []).filter(d => d.id !== myId && !directIds.has(d.id));
+      setNearby(direct);
+      setReachable(meshOnly);
+      if (BridgefyService.getScanHealth) {
+        setScanHealth(BridgefyService.getScanHealth());
+      }
     } catch (error) {
       console.error('Error loading devices:', error);
     }
-  };
+  }, []);
+
+  const scheduleLoad = useCallback((immediate = false) => {
+    if (loadingRef.current) {
+      pendingRef.current = true;
+      return;
+    }
+    if (loadTimerRef.current) clearTimeout(loadTimerRef.current);
+    loadTimerRef.current = setTimeout(async () => {
+      loadingRef.current = true;
+      try {
+        await loadDevices();
+      } finally {
+        loadingRef.current = false;
+        if (pendingRef.current) {
+          pendingRef.current = false;
+          scheduleLoad(true);
+        }
+      }
+    }, immediate ? 0 : 300);
+  }, [loadDevices]);
+
+  useFocusEffect(
+    useCallback(() => {
+      scheduleLoad(true);
+      BridgefyService.setOnDeviceListUpdatedHandler(() => scheduleLoad(false));
+      // Keep direct scan warm while this screen is visible to avoid 1s flicker.
+      scanIntervalRef.current = setInterval(async () => {
+        try {
+          await BridgefyService.getConnectedDevices();
+        } catch (_e) {}
+        scheduleLoad(false);
+      }, 6000);
+      return () => {
+        BridgefyService.setOnDeviceListUpdatedHandler(null);
+        if (scanIntervalRef.current) {
+          clearInterval(scanIntervalRef.current);
+          scanIntervalRef.current = null;
+        }
+      };
+    }, [scheduleLoad])
+  );
+
+  useEffect(() => {
+    const t = setInterval(() => {
+      if (BridgefyService.getScanHealth) {
+        setScanHealth(BridgefyService.getScanHealth());
+      }
+    }, 1000);
+    return () => clearInterval(t);
+  }, []);
 
   const onRefresh = async () => {
     setRefreshing(true);
     try {
+      await BridgefyService.getConnectedDevices();
       await loadDevices();
     } finally {
       setRefreshing(false);
@@ -72,6 +130,19 @@ const DevicesScreen = ({ navigation }) => {
           {item.battery != null && (
             <Text style={styles.batteryText}>{item.battery}% battery</Text>
           )}
+          <View style={styles.tagRow}>
+            {item.isNearby ? (
+              <View style={[styles.tag, styles.tagNearby]}>
+                <Text style={styles.tagText}>Nearby</Text>
+              </View>
+            ) : (
+              <View style={[styles.tag, styles.tagMesh]}>
+                <Text style={styles.tagText}>
+                  Mesh{item.hops != null ? ` • ${item.hops} hops` : ''}
+                </Text>
+              </View>
+            )}
+          </View>
         </View>
 
         <View style={styles.connectionDot} />
@@ -80,16 +151,65 @@ const DevicesScreen = ({ navigation }) => {
     );
   };
 
+  const sectionHeader = (title, count) => (
+    <View style={styles.sectionHeader}>
+      <Text style={styles.sectionTitle}>{title}</Text>
+      <Text style={styles.sectionCount}>{count}</Text>
+    </View>
+  );
+
+  const formatAge = (ts) => {
+    if (!ts) return 'never';
+    const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
+    return `${s}s`;
+  };
+
+  const hasDevices = nearby.length + reachable.length > 0;
+  const mergedData = hasDevices
+    ? [
+        { type: 'section', id: 'nearby_header', title: 'Nearby', count: nearby.length },
+        ...nearby.map(d => ({ ...d, isNearby: true, type: 'item' })),
+        { type: 'section', id: 'mesh_header', title: 'Reachable (Mesh)', count: reachable.length },
+        ...reachable.map(d => ({ ...d, isNearby: false, type: 'item' })),
+      ]
+    : [];
+
   return (
     <SafeAreaView style={styles.container}>
       <View style={styles.header}>
-        <Text style={styles.title}>Select Device</Text>
-        <Text style={styles.subtitle}>Tap a device to start chatting</Text>
+        <View style={styles.headerRow}>
+          <View style={styles.headerText}>
+            <Text style={styles.title}>Select Device</Text>
+            <Text style={styles.subtitle}>Tap a device to start chatting</Text>
+            <Text style={styles.scanHealth}>
+              Scan: {formatAge(scanHealth.lastDirectScanAt)} · Announce: {formatAge(scanHealth.lastAnnounceAt)} · Nearby: {scanHealth.directFreshCount ?? 0}
+            </Text>
+          </View>
+          <TouchableOpacity
+            style={styles.refreshNearbyBtn}
+            onPress={async () => {
+              setRefreshing(true);
+              try {
+                await BridgefyService.getConnectedDevices();
+                await loadDevices();
+              } finally {
+                setRefreshing(false);
+              }
+            }}
+          >
+            <Icon name="refresh" size={18} color={colors.onColor} />
+            <Text style={styles.refreshNearbyText}>Nearby</Text>
+          </TouchableOpacity>
+        </View>
       </View>
 
       <FlatList
-        data={devices}
-        renderItem={renderDevice}
+        data={mergedData}
+        renderItem={({ item }) => (
+          item.type === 'section'
+            ? sectionHeader(item.title, item.count)
+            : renderDevice({ item })
+        )}
         keyExtractor={(item) => item.id}
         contentContainerStyle={styles.list}
         refreshControl={
@@ -125,8 +245,20 @@ const makeStyles = (colors) => StyleSheet.create({
     backgroundColor: colors.headerBg,
     padding: 20,
   },
+  headerRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  headerText: { flex: 1, paddingRight: 12 },
   title:    { fontSize: 28, fontWeight: 'bold', color: colors.headerText },
   subtitle: { fontSize: 14, color: colors.headerSubtitle, marginTop: 4 },
+  scanHealth: { fontSize: 12, color: colors.headerSubtitle, marginTop: 6 },
+  refreshNearbyBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255,255,255,0.2)',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+  },
+  refreshNearbyText: { color: colors.onColor, marginLeft: 6, fontSize: 12, fontWeight: '600' },
 
   list: { padding: 16 },
 
@@ -148,8 +280,23 @@ const makeStyles = (colors) => StyleSheet.create({
   deviceName:     { fontSize: 16, fontWeight: '600', color: colors.text, marginBottom: 4 },
   deviceId:       { fontSize: 12, color: colors.textMuted },
   batteryText:    { fontSize: 11, color: colors.textMuted, marginTop: 2 },
+  tagRow:         { flexDirection: 'row', marginTop: 6 },
+  tag:            { paddingHorizontal: 8, paddingVertical: 3, borderRadius: 10 },
+  tagNearby:      { backgroundColor: colors.success + '22' },
+  tagMesh:        { backgroundColor: colors.accent + '22' },
+  tagText:        { fontSize: 11, color: colors.text },
   connectionDot:  { width: 10, height: 10, borderRadius: 5, backgroundColor: colors.success, marginRight: 8 },
   connectText:    { color: colors.connectText, fontSize: 14, fontWeight: '600' },
+
+  sectionHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 10,
+    paddingHorizontal: 4,
+  },
+  sectionTitle: { fontSize: 13, fontWeight: '700', color: colors.textMuted },
+  sectionCount: { fontSize: 12, color: colors.textMuted },
 
   emptyState: {
     flex: 1, justifyContent: 'center', alignItems: 'center',

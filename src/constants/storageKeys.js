@@ -7,3 +7,4 @@ export const WEATHER_CACHE_KEY = '@peerreach_weather_v2';
 export const THEME_PREF_KEY    = '@peerreach_theme';
 export const LAST_LOCATION_KEY  = '@peerreach_last_location';
 export const SHOW_SOS_FINDME_KEY = '@peerreach_show_sos_findme';
+export const BRIDGEFY_EVER_INIT_KEY = '@peerreach_bridgefy_ever_init';

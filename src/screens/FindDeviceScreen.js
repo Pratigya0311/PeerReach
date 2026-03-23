@@ -159,6 +159,14 @@ const FindDeviceScreen = ({ route, navigation }) => {
     // fix 8: removed redundant isMountedRef.current = true (ref initialised to true at declaration)
 
     const startWatch = () => {
+      if (!Geolocation || typeof Geolocation.watchPosition !== 'function') {
+        setPermDenied(true);
+        Alert.alert(
+          'Location unavailable',
+          'Location service is not available on this device.'
+        );
+        return;
+      }
       watchIdRef.current = Geolocation.watchPosition(
         (pos) => {
           setMyPos({ lat: pos.coords.latitude, lng: pos.coords.longitude });
