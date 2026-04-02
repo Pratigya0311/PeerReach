@@ -17,15 +17,14 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect } from '@react-navigation/native';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 import MCIcon from 'react-native-vector-icons/MaterialCommunityIcons';
-import AsyncStorage from '@react-native-async-storage/async-storage';
-import NetInfo from '@react-native-community/netinfo';
 import BridgefyService from '../services/BridgefyService';
+import NetInfo from '@react-native-community/netinfo';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import weatherService, { wmoInfo } from '../services/WeatherService';
 import { useTheme } from '../theme';
 import { formatTimeAgo } from '../utils/timeFormat';
 import { requestBridgefyPermissions } from '../utils/permissions';
 import LoadingScreen from '../components/LoadingScreen';
-import { BRIDGEFY_EVER_INIT_KEY } from '../constants/storageKeys';
 
 const SEARCH_DEBOUNCE_MS = 300;
 
@@ -46,6 +45,12 @@ const HomeScreen = ({ navigation }) => {
   const [showLocationModal, setShowLocationModal] = useState(false);
   const [nearbyPeers, setNearbyPeers]         = useState([]);
   const [myBattery, setMyBattery]             = useState(null);
+  const [permissionsGranted, setPermissionsGranted] = useState(false);
+  const [firstRunPending, setFirstRunPending] = useState(true);
+  const [hasNetwork, setHasNetwork]           = useState(true);
+  const networkAlertedRef = useRef(false);
+  const [showDebug, setShowDebug]             = useState(false);
+  const [debugLog, setDebugLog]               = useState([]);
 
   // Search state
   const [searchQuery, setSearchQuery]         = useState('');
@@ -56,9 +61,6 @@ const HomeScreen = ({ navigation }) => {
   const navTimerRef     = useRef(null);
   const infoIntervalRef = useRef(null);   // nearby peers — every 2 min
   const batteryTimerRef = useRef(null);   // battery — every 5 min
-  const internetPollRef = useRef(null);
-  const btPollRef = useRef(null);
-  const shownAlertRef = useRef({ internet: false, bluetooth: false });
 
 
 
@@ -82,14 +84,12 @@ const HomeScreen = ({ navigation }) => {
     BridgefyService.setOnReadyHandler(handleBridgefyReady);
     BridgefyService.setOnErrorHandler(handleBridgefyError);
     BridgefyService.setOnUnreadUpdatedHandler(handleUnreadUpdated);
-    BridgefyService.setOnBluetoothStateChangedHandler(handleBluetoothChanged);
     // Refresh conversation names when a device announces their display name
     BridgefyService.setOnDeviceListUpdatedHandler(() => loadData().catch(console.error));
 
     requestPermissions().then((granted) => {
-      if (granted) {
-        ensureConnectivityThenInit();
-      } else {
+      setPermissionsGranted(granted);
+      if (!granted) {
         setIsLoading(false);
         Alert.alert(
           'Permissions Required',
@@ -107,7 +107,6 @@ const HomeScreen = ({ navigation }) => {
       BridgefyService.setOnReadyHandler(null);
       BridgefyService.setOnErrorHandler(null);
       BridgefyService.setOnUnreadUpdatedHandler(null);
-      BridgefyService.setOnBluetoothStateChangedHandler(null);
       BridgefyService.setOnDeviceListUpdatedHandler(null);
       weatherService.setOnWeatherUpdated(null);
       BridgefyService.setOnLocationUpdated(null);
@@ -115,21 +114,64 @@ const HomeScreen = ({ navigation }) => {
       if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
       if (navTimerRef.current) clearTimeout(navTimerRef.current);
       if (infoIntervalRef.current) clearInterval(infoIntervalRef.current);
-      if (internetPollRef.current) clearInterval(internetPollRef.current);
-      if (btPollRef.current) clearInterval(btPollRef.current);
     };
   }, []);
+
+  useEffect(() => {
+    AsyncStorage.getItem('@peerreach_first_run_done')
+      .then((value) => setFirstRunPending(!value))
+      .catch(() => setFirstRunPending(true));
+  }, []);
+
+  useEffect(() => {
+    const unsubscribe = NetInfo.addEventListener((state) => {
+      const connected = !!state.isConnected;
+      setHasNetwork(connected);
+      if (firstRunPending && !connected && !networkAlertedRef.current) {
+        networkAlertedRef.current = true;
+        Alert.alert(
+          'Internet Required',
+          'Internet connectivity is required only for first-time activation. Please connect and we will continue automatically.'
+        );
+        setIsLoading(false);
+        setBridgefyStatus('error');
+      }
+      if (connected) {
+        networkAlertedRef.current = false;
+      }
+    });
+    return () => unsubscribe();
+  }, [firstRunPending]);
+
+  useEffect(() => {
+    if (!permissionsGranted) return;
+    if (firstRunPending && !hasNetwork) return;
+    initializeBridgefy();
+  }, [permissionsGranted, firstRunPending, hasNetwork]);
+
+  // Light debug log refresh (no heavy logging)
+  useEffect(() => {
+    if (!showDebug) return;
+    const t = setInterval(() => {
+      if (BridgefyService.getDebugLog) {
+        setDebugLog(BridgefyService.getDebugLog());
+      }
+    }, 1000);
+    return () => clearInterval(t);
+  }, [showDebug]);
 
 
   // ─── Permissions ──────────────────────────────────────────────────────────
   const requestPermissions = requestBridgefyPermissions;
 
   // ─── Init ─────────────────────────────────────────────────────────────────
+  const getBridgefyKey = () => '8a349463-829d-4c67-a489-4a4c5cb82eba';
+
   const initializeBridgefy = async () => {
     try {
       setBridgefyStatus('initializing');
       console.log('🚀 Initializing Bridgefy...');
-      const API_KEY = '8a349463-829d-4c67-a489-4a4c5cb82eba';
+      const API_KEY = getBridgefyKey();
       if (!API_KEY || API_KEY.length < 36) {
         Alert.alert('Invalid API Key', 'Please check your Bridgefy API key configuration.');
         setIsLoading(false);
@@ -138,21 +180,7 @@ const HomeScreen = ({ navigation }) => {
       }
       // initialize() fires-and-forgets on the native side (no Promise).
       // Actual readiness is signalled by onRegistrationSuccessful → handleBridgefyReady.
-      // We just add a safety timeout so the loading screen doesn't hang forever.
       BridgefyService.initialize(API_KEY);
-      navTimerRef.current = setTimeout(() => {
-        setIsLoading(prev => {
-          if (prev) {
-            setBridgefyStatus('error');
-            Alert.alert(
-              'Initialization Timeout',
-              'Could not start mesh network. Please check Bluetooth is enabled and permissions are granted.',
-              [{ text: 'OK' }]
-            );
-          }
-          return false;
-        });
-      }, 20000);
     } catch (error) {
       console.error('❌ Bridgefy initialization failed:', error);
       setBridgefyStatus('error');
@@ -165,59 +193,7 @@ const HomeScreen = ({ navigation }) => {
     }
   };
 
-  const ensureConnectivityThenInit = async () => {
-    try {
-      const ever = await AsyncStorage.getItem(BRIDGEFY_EVER_INIT_KEY);
-      if (!ever) {
-        const net = await NetInfo.fetch();
-        if (!net.isConnected) {
-          setBridgefyStatus('waiting_internet');
-          setIsLoading(true);
-          if (!shownAlertRef.current.internet) {
-            shownAlertRef.current.internet = true;
-            Alert.alert('No Internet', 'Internet is required only for first-time initialization. We will auto-start when it is back.');
-          }
-          if (!internetPollRef.current) {
-            internetPollRef.current = setInterval(async () => {
-              const state = await NetInfo.fetch();
-              if (state.isConnected) {
-                clearInterval(internetPollRef.current);
-                internetPollRef.current = null;
-                ensureConnectivityThenInit();
-              }
-            }, 5000);
-          }
-          return;
-        }
-      }
-
-      const btEnabled = await BridgefyService.getBluetoothState();
-      if (!btEnabled) {
-        setBridgefyStatus('waiting_bluetooth');
-        setIsLoading(true);
-        if (!shownAlertRef.current.bluetooth) {
-          shownAlertRef.current.bluetooth = true;
-          Alert.alert('Bluetooth Off', 'Please turn on Bluetooth. PeerReach will auto-start when it is enabled.');
-        }
-        if (!btPollRef.current) {
-          btPollRef.current = setInterval(async () => {
-            const enabled = await BridgefyService.getBluetoothState();
-            if (enabled) {
-              clearInterval(btPollRef.current);
-              btPollRef.current = null;
-              ensureConnectivityThenInit();
-            }
-          }, 5000);
-        }
-        return;
-      }
-
-      initializeBridgefy();
-    } catch (err) {
-      console.error('ensureConnectivityThenInit error:', err);
-      initializeBridgefy();
-    }
-  };
+  // Internet/Bluetooth gating removed (back to main behavior)
 
   const loadData = async () => {
     try {
@@ -243,6 +219,7 @@ const HomeScreen = ({ navigation }) => {
     setMyDeviceName(data.deviceName);
     setBridgefyStatus('ready');
     setIsLoading(false);
+    AsyncStorage.setItem('@peerreach_first_run_done', '1').catch(() => {});
     AsyncStorage.setItem(BRIDGEFY_EVER_INIT_KEY, '1').catch(() => {});
     loadData().catch(err => console.error('Error loading data on ready:', err));
     // Show cached weather immediately, then get live updates via WeatherService
@@ -287,23 +264,9 @@ const HomeScreen = ({ navigation }) => {
         ]
       );
     }
+    // No forced timeout or retry here — initialization can take time.
   };
 
-  const handleBluetoothChanged = (data) => {
-    const enabled = data?.enabled !== false;
-    if (!enabled) {
-      setBridgefyStatus('waiting_bluetooth');
-      setIsLoading(true);
-      if (!shownAlertRef.current.bluetooth) {
-        shownAlertRef.current.bluetooth = true;
-        Alert.alert('Bluetooth Off', 'Please turn on Bluetooth. PeerReach will auto-start when it is enabled.');
-      }
-      return;
-    }
-    if (bridgefyStatus !== 'ready') {
-      ensureConnectivityThenInit();
-    }
-  };
   const handleUnreadUpdated  = (counts) => setUnreadCounts(counts);
 
   // ─── Navigation ───────────────────────────────────────────────────────────
@@ -491,20 +454,64 @@ const HomeScreen = ({ navigation }) => {
 
   // ─── Loading state ────────────────────────────────────────────────────────
   if (isLoading) {
-    const sub =
-      bridgefyStatus === 'waiting_internet'
-        ? 'Waiting for internet (first-time setup)...'
-        : bridgefyStatus === 'waiting_bluetooth'
-        ? 'Waiting for Bluetooth...'
-        : bridgefyStatus === 'error'
-        ? 'Failed to start. Please check permissions.'
-        : 'Initializing mesh network...';
-    return <LoadingScreen message="Starting PeerReach..." subMessage={sub} />;
+    const sub = bridgefyStatus === 'error' ? 'Failed to start. Please check permissions.' : 'Initializing mesh network...';
+    return (
+      <LoadingScreen
+        message="Starting PeerReach..."
+        subMessage={sub}
+        actionLabel="Retry Init"
+        onActionPress={async () => {
+          try {
+            setBridgefyStatus('initializing');
+            await BridgefyService.forceReinitialize(getBridgefyKey());
+          } catch (_e) {
+            // keep loading screen, debug panel will show details
+          }
+        }}
+        secondaryActionLabel="Debug"
+        onSecondaryActionPress={() => setShowDebug(true)}
+      />
+    );
   }
 
   // ─── Main render ──────────────────────────────────────────────────────────
   return (
     <SafeAreaView style={styles.container}>
+      {/* Debug modal */}
+      <Modal visible={showDebug} transparent animationType="slide" onRequestClose={() => setShowDebug(false)}>
+        <View style={styles.debugOverlay}>
+          <View style={styles.debugCard}>
+            <View style={styles.debugHeader}>
+              <Text style={styles.debugTitle}>Bridgefy Debug</Text>
+              <TouchableOpacity onPress={() => setShowDebug(false)}>
+                <Icon name="close" size={20} color={colors.textMuted} />
+              </TouchableOpacity>
+            </View>
+            <ScrollView style={styles.debugBody}>
+              {debugLog.length === 0 ? (
+                <Text style={styles.debugLine}>No debug events yet.</Text>
+              ) : (
+                debugLog.map((e, idx) => (
+                  <Text key={`${e.ts}_${idx}`} style={styles.debugLine}>
+                    [{new Date(e.ts).toLocaleTimeString()}] {e.event} {e.data ? JSON.stringify(e.data) : ''}
+                  </Text>
+                ))
+              )}
+            </ScrollView>
+            <TouchableOpacity
+              style={styles.debugBtn}
+              onPress={async () => {
+                try {
+                  setBridgefyStatus('initializing');
+                  await BridgefyService.forceReinitialize(getBridgefyKey());
+                } catch (_e) {}
+              }}
+            >
+              <Text style={styles.debugBtnText}>Retry Init</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
 
       {/* Weather report modal */}
       <Modal visible={showWeatherModal} transparent animationType="slide" onRequestClose={() => setShowWeatherModal(false)}>
@@ -1060,6 +1067,24 @@ const makeStyles = (colors) => StyleSheet.create({
   emptySubtext: { fontSize: 14, color: colors.textMuted, textAlign: 'center', marginBottom: 24, lineHeight: 20 },
   emptyButton:  { backgroundColor: colors.primary, paddingHorizontal: 24, paddingVertical: 12, borderRadius: 8 },
   emptyButtonText: { color: colors.onColor, fontSize: 16, fontWeight: '600' },
+
+  // Debug modal
+  debugOverlay: {
+    flex: 1, backgroundColor: 'rgba(0,0,0,0.55)',
+    justifyContent: 'center', alignItems: 'center',
+    padding: 20,
+  },
+  debugCard: {
+    width: '100%', maxHeight: '80%',
+    backgroundColor: colors.surface,
+    borderRadius: 12, padding: 16,
+  },
+  debugHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 },
+  debugTitle: { fontSize: 16, fontWeight: '700', color: colors.text },
+  debugBody: { maxHeight: 360 },
+  debugLine: { fontSize: 12, color: colors.textSecondary, marginBottom: 6 },
+  debugBtn: { marginTop: 12, backgroundColor: colors.primary, paddingVertical: 10, borderRadius: 8, alignItems: 'center' },
+  debugBtnText: { color: colors.onColor, fontSize: 14, fontWeight: '600' },
 
 
   // Weather report modal

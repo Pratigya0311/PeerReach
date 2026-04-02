@@ -563,7 +563,6 @@ class BridgefyService {
   async sendAnnounce(status, hop) {
     try {
       if (!this.isInitialized || !this.myDeviceId) return;
-      const battery = await this._getBattery();
       this.lastAnnounceAt = Date.now();
       const announceId = `${this.myDeviceId}:${Date.now()}`;
       const payload = {
@@ -574,13 +573,10 @@ class BridgefyService {
         status: status,
         hop: hop,
         announceId: announceId,
-        ts: Date.now(),
-        battery: battery
+        ts: Date.now()
       };
       if (Bridgefy.sendBroadcastPayload) {
         await Bridgefy.sendBroadcastPayload(JSON.stringify(payload));
-      } else {
-        await Bridgefy.sendBroadcast(JSON.stringify(payload));
       }
     } catch (error) {
       console.error('Error sending announce:', error);
@@ -598,7 +594,7 @@ class BridgefyService {
       this.seenAnnounces.set(announceId, Date.now());
 
       const userId = rawMessage.userId;
-      const userName = rawMessage.userName || rawMessage.name || 'Unknown Device';
+      const userName = rawMessage.userName || 'Unknown Device';
       const hop = parseInt(rawMessage.hop, 10) || 0;
       const distance = hop + 1;
       const senderId = rawMessage.senderId || null;
@@ -615,10 +611,6 @@ class BridgefyService {
         is_online: status === 'online' ? 1 : 0
       });
 
-      if (rawMessage.battery != null) {
-        this.deviceBatteries.set(userId, rawMessage.battery);
-      }
-
       if (status === 'online') {
         this.offlineBlocked.delete(userId);
         await this.flushQueuedMessages(userId);
@@ -627,6 +619,7 @@ class BridgefyService {
         this.connectedDevices.delete(userId);
         this.directCache.delete(userId);
         this.directActivity.delete(userId);
+        this.directStickyUntil?.delete?.(userId);
       }
 
       if (distance < MAX_HOPS) {
@@ -638,13 +631,10 @@ class BridgefyService {
           status: status,
           hop: hop + 1,
           announceId: announceId,
-          ts: rawMessage.ts || Date.now(),
-          battery: rawMessage.battery
+          ts: rawMessage.ts || Date.now()
         };
         if (Bridgefy.sendBroadcastPayload) {
           await Bridgefy.sendBroadcastPayload(JSON.stringify(forwardPayload));
-        } else {
-          await Bridgefy.sendBroadcast(JSON.stringify(forwardPayload));
         }
       }
     } catch (error) {
@@ -1038,6 +1028,33 @@ class BridgefyService {
     }
   }
 
+  async forceReinitialize(apiKey = null) {
+    try {
+      this._pushDebug('force_reinit_start');
+      this.isInitializing = true;
+      this.isInitialized = false;
+      try { await Bridgefy.stop(); } catch (_e) {}
+      this.stopAnnounceLoop();
+      this.stopHealthCheck();
+      this.stopWatchdog();
+      this.pendingSendMap.clear();
+      this.sendCooldowns.clear();
+      if (apiKey) {
+        this.lastApiKey = apiKey;
+        this._apiKey = apiKey;
+      }
+      if (!this.lastApiKey) throw new Error('Missing API key for reinit');
+      await Bridgefy.initialize(this.lastApiKey);
+      this._pushDebug('force_reinit_called');
+      return true;
+    } catch (error) {
+      this._pushDebug('force_reinit_failed', { error: error?.message || error });
+      throw error;
+    } finally {
+      this.isInitializing = false;
+    }
+  }
+
   async sendMessage(receiverId, text, replyTo = null) {
     if (!this.myDeviceId) throw new Error('Mesh not ready — please wait for initialization');
     const canSend = await this.isReceiverOnline(receiverId);
@@ -1263,31 +1280,16 @@ class BridgefyService {
     try {
       const minLastSeen = Date.now() - ANNOUNCE_TTL_MS;
       const users = await databaseService.getKnownUsers(minLastSeen);
-      const directFreshIds = new Set(this._getDirectListFromCache({ freshOnly: true }).map(d => d.id));
-      const staleDirect = this.getStaleDirectDevices();
-      const map = new Map();
-      for (const u of users) {
-        if (u.id === this.myDeviceId || directFreshIds.has(u.id)) continue;
-        map.set(u.id, {
+      const directIds = new Set(this.connectedDevices.keys());
+      return users
+        .filter(u => u.id !== this.myDeviceId && !directIds.has(u.id))
+        .map(u => ({
           id: u.id,
           name: u.name,
           hops: u.hops,
           lastSeen: u.last_seen,
           viaPeer: u.via_peer
-        });
-      }
-      for (const d of staleDirect) {
-        if (!map.has(d.id)) {
-          map.set(d.id, {
-            id: d.id,
-            name: d.name,
-            hops: d.hops ?? 1,
-            lastSeen: d.lastSeen ?? null,
-            viaPeer: null
-          });
-        }
-      }
-      return Array.from(map.values());
+        }));
     } catch (error) {
       console.error('Error getting reachable users:', error);
       return [];
