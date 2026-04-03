@@ -18,8 +18,13 @@ import { useFocusEffect } from '@react-navigation/native';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 import MCIcon from 'react-native-vector-icons/MaterialCommunityIcons';
 import BridgefyService from '../services/BridgefyService';
-import NetInfo from '@react-native-community/netinfo';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+let NetInfo = null;
+try {
+  NetInfo = require('@react-native-community/netinfo').default || require('@react-native-community/netinfo');
+} catch (_e) {
+  NetInfo = null;
+}
 import weatherService, { wmoInfo } from '../services/WeatherService';
 import { useTheme } from '../theme';
 import { formatTimeAgo } from '../utils/timeFormat';
@@ -124,6 +129,7 @@ const HomeScreen = ({ navigation }) => {
   }, []);
 
   useEffect(() => {
+    if (!NetInfo) return;
     const unsubscribe = NetInfo.addEventListener((state) => {
       const connected = !!state.isConnected;
       setHasNetwork(connected);
@@ -165,7 +171,7 @@ const HomeScreen = ({ navigation }) => {
   const requestPermissions = requestBridgefyPermissions;
 
   // ─── Init ─────────────────────────────────────────────────────────────────
-  const getBridgefyKey = () => '8a349463-829d-4c67-a489-4a4c5cb82eba';
+  const getBridgefyKey = () => '2d08157f-ef63-46b8-891a-1aec2e08a299';
 
   const initializeBridgefy = async () => {
     try {
