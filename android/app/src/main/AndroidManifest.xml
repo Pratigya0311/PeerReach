@@ -29,7 +29,7 @@
       android:requestLegacyExternalStorage="true">
       <meta-data
             android:name="com.bridgefy.sdk.API_KEY"
-            android:value="2d08157f-ef63-46b8-891a-1aec2e08a299" />
+            android:value="b6cbd7cb-5e22-491a-8bde-137d61a2050e" />
       <activity
         android:name=".MainActivity"
         android:label="@string/app_name"

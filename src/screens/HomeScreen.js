@@ -19,6 +19,7 @@ import Icon from 'react-native-vector-icons/MaterialIcons';
 import MCIcon from 'react-native-vector-icons/MaterialCommunityIcons';
 import BridgefyService from '../services/BridgefyService';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { BRIDGEFY_EVER_INIT_KEY } from '../constants/storageKeys';
 let NetInfo = null;
 try {
   NetInfo = require('@react-native-community/netinfo').default || require('@react-native-community/netinfo');
@@ -171,7 +172,7 @@ const HomeScreen = ({ navigation }) => {
   const requestPermissions = requestBridgefyPermissions;
 
   // ─── Init ─────────────────────────────────────────────────────────────────
-  const getBridgefyKey = () => '2d08157f-ef63-46b8-891a-1aec2e08a299';
+  const getBridgefyKey = () => 'b6cbd7cb-5e22-491a-8bde-137d61a2050e';
 
   const initializeBridgefy = async () => {
     try {
