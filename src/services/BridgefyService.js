@@ -2,6 +2,11 @@
 import { NativeModules, NativeEventEmitter, Platform, AppState } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import databaseService from './DatabaseService';
+import cryptoService, {
+  CRYPTO_KEY_ADVERT_TYPE,
+  CRYPTO_KEY_REQUEST_TYPE,
+  SECURE_ENVELOPE_TYPE,
+} from './CryptoService';
 import gatewayService from './GatewayService';
 import weatherService from './WeatherService';
 
@@ -30,7 +35,6 @@ class BridgefyService {
     this._locationInterval = null;
     this.onLocationUpdated = null;
     this._batteryWarningSent = false;
-    this._sendBattery = true;
     this.myDeviceId = null;
     this._apiKey = null;
     this.useAsyncStorage = false;
@@ -58,6 +62,7 @@ class BridgefyService {
     this._inflightQueued = new Set();
     this._recentQueued = new Map();
     this._lastFailureLogAt = new Map();
+    this.pendingCryptoKeyRequests = new Map();
     this._postInitDirectRefreshTimers = [];
 
     // Handlers for special events
@@ -172,6 +177,7 @@ class BridgefyService {
         this.myDeviceName = (saved && saved.trim()) ? saved.trim() : hwName;
         this.isInitialized = true;
         this.healthMissCount = 0;
+        await cryptoService.ensureReady().catch(() => {});
         gatewayService.setMyDeviceId(this.myDeviceId);
         weatherService.setMyDeviceId(this.myDeviceId);
         await databaseService.saveDevice({
@@ -213,6 +219,7 @@ class BridgefyService {
             name: resolvedName,
             connection_status: 'online'
           });
+          this._sendCryptoKeyAdvert(id).catch(() => {});
           this.sendAnnounce('online', 0);
           await this.flushQueuedMessages(id);
           await this.flushQueuedBroadcasts();
@@ -265,7 +272,7 @@ class BridgefyService {
 
     bridgefyEmitter.addListener('onMessageReceived', async (rawMessage) => {
       try {
-        console.log('Direct message received:', rawMessage);
+        console.log('Direct message received');
         await this.handleIncomingMessage(rawMessage, false);
       } catch (err) {
         console.error('onMessageReceived error:', err);
@@ -274,7 +281,7 @@ class BridgefyService {
 
     bridgefyEmitter.addListener('onBroadcastMessageReceived', async (rawMessage) => {
       try {
-        console.log('Broadcast message received:', rawMessage);
+        console.log('Broadcast message received');
         await this.handleIncomingMessage(rawMessage, true);
       } catch (err) {
         console.error('onBroadcastMessageReceived error:', err);
@@ -345,75 +352,119 @@ class BridgefyService {
         await this.handleAnnounce(rawMessage);
         return;
       }
-      const rawContent = rawMessage.content || '';
+      let rawContent = rawMessage.content || '';
+      let parsedContent = null;
+      let secureEnvelope = null;
 
-      // Intercept protocol messages â€” don't save to chat DB
       if (rawContent) {
         try {
-          const parsed = JSON.parse(rawContent);
-          if (
-            parsed.type === 'internet_request' ||
-            parsed.type === 'internet_response' ||
-            parsed.type === 'cache_share'
-          ) {
-            await gatewayService.handleIncomingGatewayMessage(parsed, rawMessage.senderId);
-            return;
-          }
-          // Typing indicator â€” ephemeral, never stored
-          if (parsed.type === 'typing') {
-            const senderId = rawMessage.senderId || parsed.senderId;
-            const senderName = parsed.senderName || this.connectedDevices.get(senderId) || 'Someone';
-            this.emitEvent('onTyping', { senderId, senderName, isBroadcast });
-            return;
-          }
-
-          // Announce â€” ephemeral, update device info
-          if (parsed.type === 'announce') {
-            await this.handleAnnounce({
-              announceId: parsed.announceId,
-              userId: parsed.userId || parsed.deviceId,
-              userName: parsed.userName || parsed.name,
-              status: parsed.status || 'online',
-              hop: parsed.hop,
-              ts: parsed.ts || parsed.timestamp,
-              battery: parsed.battery,
-              senderId: rawMessage.senderId
-            });
-            return;
-          }
-
-          // Battery warning â€” show as system message in active chats
-          if (parsed.type === 'battery_warning') {
-            this._handleAnnounce(parsed, rawMessage.senderId); // update battery map
-            this.emitEvent('onBatteryWarning', { senderId: parsed.deviceId || rawMessage.senderId, name: parsed.name, battery: parsed.battery });
-            return;
-          }
-
-          // Weather update â€” share through mesh, never store in chat
-          if (parsed.type === 'weather_update') {
-            weatherService.handleWeatherUpdate(parsed, rawMessage.senderId);
-            return;
-          }
-
-          // Delivery / read ack â€” update sent message status
-          if (parsed.type === 'ack') {
-            this._handleAck(parsed);
-            return;
-          }
+          parsedContent = JSON.parse(rawContent);
         } catch {
-          // Not JSON â€” treat as regular chat message below
+          parsedContent = null;
+        }
+      }
+
+      if (!isBroadcast && parsedContent?.type === SECURE_ENVELOPE_TYPE) {
+        try {
+          const decrypted = await cryptoService.decryptEnvelope(parsedContent);
+          secureEnvelope = decrypted?.envelope || parsedContent;
+          rawContent = decrypted?.plaintext || rawContent;
+          try {
+            parsedContent = rawContent ? JSON.parse(rawContent) : null;
+          } catch {
+            parsedContent = null;
+          }
+        } catch (error) {
+          console.warn('Secure direct message could not be decrypted:', error?.message || error);
+          return;
+        }
+      }
+
+      // Intercept protocol messages â€” don't save to chat DB
+      if (parsedContent) {
+        const parsed = parsedContent;
+        const senderId = rawMessage.senderId || parsed.senderId;
+
+        if (senderId && parsed.cryptoPublicKey) {
+          await this._rememberPeerCryptoKey(senderId, parsed.cryptoPublicKey);
+        }
+
+        if (
+          parsed.type === 'internet_request' ||
+          parsed.type === 'internet_response' ||
+          parsed.type === 'cache_share'
+        ) {
+          await gatewayService.handleIncomingGatewayMessage(parsed, rawMessage.senderId);
+          return;
+        }
+
+        if (parsed.type === CRYPTO_KEY_REQUEST_TYPE) {
+          await this._handleCryptoKeyRequest(parsed, rawMessage.senderId);
+          return;
+        }
+
+        if (parsed.type === CRYPTO_KEY_ADVERT_TYPE) {
+          await this._handleCryptoKeyAdvert(parsed, rawMessage.senderId);
+          return;
+        }
+
+        // Typing indicator â€” ephemeral, never stored
+        if (parsed.type === 'typing') {
+          const resolvedSenderId = rawMessage.senderId || parsed.senderId;
+          const senderName = parsed.senderName || this.connectedDevices.get(resolvedSenderId) || 'Someone';
+          this.emitEvent('onTyping', { senderId: resolvedSenderId, senderName, isBroadcast });
+          return;
+        }
+
+        // Announce â€” ephemeral, update device info
+        if (parsed.type === 'announce') {
+          await this.handleAnnounce({
+            announceId: parsed.announceId,
+            userId: parsed.userId || parsed.deviceId,
+            userName: parsed.userName || parsed.name,
+            status: parsed.status || 'online',
+            hop: parsed.hop,
+            ts: parsed.ts || parsed.timestamp,
+            battery: parsed.battery,
+            cryptoPublicKey: parsed.cryptoPublicKey,
+            senderId: rawMessage.senderId
+          });
+          return;
+        }
+
+        // Battery warning â€” show as system message in active chats
+        if (parsed.type === 'battery_warning') {
+          await this._handleAnnounce(parsed, rawMessage.senderId); // update battery map
+          this.emitEvent('onBatteryWarning', { senderId: parsed.deviceId || rawMessage.senderId, name: parsed.name, battery: parsed.battery });
+          return;
+        }
+
+        // Weather update â€” share through mesh, never store in chat
+        if (parsed.type === 'weather_update') {
+          weatherService.handleWeatherUpdate(parsed, rawMessage.senderId);
+          return;
+        }
+
+        // Delivery / read ack â€” update sent message status
+        if (parsed.type === 'ack') {
+          this._handleAck(parsed);
+          return;
         }
       }
 
       const messageType = isBroadcast ? 'broadcast' : 'direct';
       const senderId = rawMessage.senderId || 'unknown';
+      const incomingSenderName = parsedContent?.senderName || secureEnvelope?.senderName || rawMessage.senderName || null;
       // Prefer stored display name (set via announce) over SDK hardware name
-      const senderName = this.connectedDevices.get(senderId) || rawMessage.senderName || 'Unknown Device';
+      const senderName = this.connectedDevices.get(senderId) || incomingSenderName || 'Unknown Device';
 
       // Only update name for direct peers (avoid polluting direct list for mesh-only users)
-      if (rawMessage.senderName && this.connectedDevices.has(senderId)) {
-        this.connectedDevices.set(senderId, rawMessage.senderName);
-        databaseService.saveDevice({ id: senderId, name: rawMessage.senderName, connection_status: 'online' }).catch(() => {});
+      if (incomingSenderName && this.connectedDevices.has(senderId)) {
+        const knownName = this.connectedDevices.get(senderId);
+        if (!knownName || this._isFallbackPeerName(knownName, senderId)) {
+          this.connectedDevices.set(senderId, incomingSenderName);
+          databaseService.saveDevice({ id: senderId, name: incomingSenderName, connection_status: 'online' }).catch(() => {});
+        }
       }
 
       // Detect content types from JSON payload
@@ -570,6 +621,7 @@ class BridgefyService {
       if (!this.isInitialized || !this.myDeviceId) return;
       this.lastAnnounceAt = Date.now();
       const announceId = `${this.myDeviceId}:${Date.now()}`;
+      const cryptoPublicKey = await cryptoService.getMyPublicKey().catch(() => null);
       const payload = {
         type: 'announce',
         text: '',
@@ -581,6 +633,9 @@ class BridgefyService {
         announceId: announceId,
         ts: Date.now()
       };
+      if (cryptoPublicKey) {
+        payload.cryptoPublicKey = cryptoPublicKey;
+      }
       if (Bridgefy.sendBroadcastPayload) {
         await Bridgefy.sendBroadcastPayload(JSON.stringify(payload));
       }
@@ -608,6 +663,10 @@ class BridgefyService {
 
       if (!userId || userId === this.myDeviceId) return;
 
+      if (rawMessage.cryptoPublicKey) {
+        await this._rememberPeerCryptoKey(userId, rawMessage.cryptoPublicKey);
+      }
+
       await databaseService.upsertKnownUser({
         id: userId,
         name: userName,
@@ -633,7 +692,8 @@ class BridgefyService {
           status: status,
           hop: hop + 1,
           announceId: announceId,
-          ts: rawMessage.ts || Date.now()
+          ts: rawMessage.ts || Date.now(),
+          cryptoPublicKey: rawMessage.cryptoPublicKey || null,
         };
         if (Bridgefy.sendBroadcastPayload) {
           await Bridgefy.sendBroadcastPayload(JSON.stringify(forwardPayload));
@@ -836,22 +896,14 @@ class BridgefyService {
   }
 
   async sendDirectRaw(receiverId, text) {
-    const response = await Bridgefy.sendMessage(receiverId, text);
-    if (response?.id) {
-      this.pendingSendMap.set(response.id, receiverId);
-    }
-    return response;
+    return this._sendSecureDirectText(receiverId, text, false);
   }
 
   async sendMeshRaw(receiverId, text) {
     if (!Bridgefy.sendMeshMessage) {
       throw new Error('Mesh send not available');
     }
-    const response = await Bridgefy.sendMeshMessage(receiverId, text);
-    if (response?.id) {
-      this.pendingSendMap.set(response.id, receiverId);
-    }
-    return response;
+    return this._sendSecureDirectText(receiverId, text, true);
   }
 
   async flushQueuedMessages(receiverId = null) {
@@ -869,6 +921,9 @@ class BridgefyService {
         }
         await databaseService.updateMessageStatus(msg.id, 'sent');
       } catch (error) {
+        if (error?.code === 'SECURE_CHANNEL_PENDING') {
+          continue;
+        }
         this.applySendFailure(msg.receiverId);
       }
     }
@@ -880,7 +935,9 @@ class BridgefyService {
     return;
   }
   showNotification(message) {
-    const preview = (message.text || `[${message.contentType || 'message'}]`).substring(0, 50);
+    const preview = message.isBroadcast
+      ? (message.text || `[${message.contentType || 'message'}]`).substring(0, 50)
+      : `[${message.contentType || 'message'}]`;
     console.log(`Ã°Å¸â€â€ NEW ${message.isBroadcast ? 'BROADCAST' : 'MESSAGE'} from ${message.senderName}: ${preview}...`);
   }
 
@@ -941,18 +998,6 @@ class BridgefyService {
     };
   }
 
-  // Inject battery into outgoing JSON payloads (location is never shared passively)
-  async _injectMeta(payload) {
-    try {
-      const battery = await this._getBattery();
-      const parsed = JSON.parse(payload);
-      parsed._bat = battery;
-      return JSON.stringify(parsed);
-    } catch (_e) {
-      return payload;
-    }
-  }
-
   // Converts a saved DB row back to the app message format used by screens.
   _buildAppMessage(dbMsg, { contentType = 'text', mediaData = null, text = null } = {}) {
     // For photo/location the content is a JSON blob â€” extract the human-readable text field.
@@ -981,6 +1026,139 @@ class BridgefyService {
       replyToId: dbMsg.reply_to_id || null,
       replyPreview: dbMsg.reply_preview || null,
     };
+  }
+
+  async _rememberPeerCryptoKey(deviceId, publicKey) {
+    if (!deviceId || !publicKey) {
+      return false;
+    }
+
+    try {
+      const updated = await cryptoService.rememberPeerPublicKey(deviceId, publicKey);
+      if (updated) {
+        this.pendingCryptoKeyRequests.delete(deviceId);
+        this.flushQueuedMessages(deviceId).catch(() => {});
+      }
+      return updated;
+    } catch (error) {
+      console.warn('Could not store peer crypto key:', error?.message || error);
+      return false;
+    }
+  }
+
+  async _requestPeerCryptoKey(receiverId) {
+    if (!receiverId || !this.myDeviceId) {
+      return;
+    }
+
+    const lastRequestedAt = this.pendingCryptoKeyRequests.get(receiverId) || 0;
+    if (Date.now() - lastRequestedAt < 5000) {
+      return;
+    }
+
+    this.pendingCryptoKeyRequests.set(receiverId, Date.now());
+
+    try {
+      const payload = await cryptoService.buildKeyRequestPayload(this.myDeviceId, this.myDeviceName);
+      if (!this.isDirectDevice(receiverId) && Bridgefy.sendMeshMessage) {
+        await Bridgefy.sendMeshMessage(receiverId, payload);
+      } else {
+        await this.sendDirectProtocol(receiverId, payload);
+      }
+    } catch (error) {
+      console.warn('Could not request peer crypto key:', error?.message || error);
+    }
+  }
+
+  async _sendCryptoKeyAdvert(receiverId) {
+    if (!receiverId || !this.myDeviceId) {
+      return;
+    }
+
+    try {
+      const payload = await cryptoService.buildKeyAdvertPayload(this.myDeviceId, this.myDeviceName);
+      if (!this.isDirectDevice(receiverId) && Bridgefy.sendMeshMessage) {
+        await Bridgefy.sendMeshMessage(receiverId, payload);
+      } else {
+        await this.sendDirectProtocol(receiverId, payload);
+      }
+    } catch (error) {
+      console.warn('Could not advertise crypto key:', error?.message || error);
+    }
+  }
+
+  async _buildSecureDirectPayload(receiverId, plaintext, kind = 'direct') {
+    const encryptedPayload = await cryptoService.encryptForPeer(receiverId, plaintext, {
+      senderId: this.myDeviceId,
+      senderName: this.myDeviceName,
+      receiverId,
+      timestamp: Date.now(),
+      kind,
+    });
+
+    if (!encryptedPayload) {
+      await this._requestPeerCryptoKey(receiverId);
+      return null;
+    }
+
+    return encryptedPayload;
+  }
+
+  async _sendSecureDirectText(receiverId, text, viaMesh = false) {
+    const secureText = await this._buildSecureDirectPayload(receiverId, text, viaMesh ? 'mesh_text' : 'direct_text');
+    if (!secureText) {
+      const error = new Error('Secure channel is still preparing. Your message has been queued.');
+      error.code = 'SECURE_CHANNEL_PENDING';
+      throw error;
+    }
+
+    const response = viaMesh
+      ? await Bridgefy.sendMeshMessage(receiverId, secureText)
+      : await Bridgefy.sendMessage(receiverId, secureText);
+
+    if (response?.id) {
+      this.pendingSendMap.set(response.id, receiverId);
+    }
+
+    return response;
+  }
+
+  async _sendSecureDirectPayload(receiverId, payload, kind = 'direct_payload') {
+    const securePayload = await this._buildSecureDirectPayload(receiverId, payload, kind);
+    if (!securePayload) {
+      const error = new Error('Secure channel is still preparing. Please try again in a moment.');
+      error.code = 'SECURE_CHANNEL_PENDING';
+      throw error;
+    }
+
+    const response = await Bridgefy.sendPayload(receiverId, securePayload);
+    if (response?.id) {
+      this.pendingSendMap.set(response.id, receiverId);
+    }
+
+    return response;
+  }
+
+  async _handleCryptoKeyRequest(parsed, rawSenderId) {
+    const senderId = rawSenderId || parsed.senderId;
+    if (!senderId || senderId === this.myDeviceId) {
+      return;
+    }
+
+    if (parsed.cryptoPublicKey) {
+      await this._rememberPeerCryptoKey(senderId, parsed.cryptoPublicKey);
+    }
+
+    await this._sendCryptoKeyAdvert(senderId);
+  }
+
+  async _handleCryptoKeyAdvert(parsed, rawSenderId) {
+    const senderId = rawSenderId || parsed.senderId;
+    if (!senderId || !parsed.cryptoPublicKey) {
+      return;
+    }
+
+    await this._rememberPeerCryptoKey(senderId, parsed.cryptoPublicKey);
   }
 
   // ============ PUBLIC API ============
@@ -1041,15 +1219,12 @@ class BridgefyService {
 
   async sendMessage(receiverId, text, _replyTo = null) {
     try {
-      console.log(`📤 Sending to ${receiverId}: ${text}`);
+      console.log(`📤 Sending secure direct message to ${receiverId}`);
       const canSend = await this.isReceiverOnline(receiverId);
       if (!canSend || this.isInCooldown(receiverId)) {
         return this.queueOutgoingMessage(receiverId, text);
       }
-      const response = await Bridgefy.sendMessage(receiverId, text);
-      if (response?.id) {
-        this.pendingSendMap.set(response.id, receiverId);
-      }
+      const response = await this._sendSecureDirectText(receiverId, text, false);
       
       // Create database message
       const dbMessage = {
@@ -1083,23 +1258,22 @@ class BridgefyService {
         read: true
       };
     } catch (error) {
-      console.error('Send message failed:', error);
+      if (error?.code !== 'SECURE_CHANNEL_PENDING') {
+        console.error('Send message failed:', error);
+      }
       return this.queueOutgoingMessage(receiverId, text);
     }
   }
 
   async sendMeshMessage(receiverId, text) {
     try {
-      console.log(`Sending mesh to ${receiverId}: ${text}`);
+      console.log(`Sending secure mesh message to ${receiverId}`);
       const canSend = await this.isReceiverOnline(receiverId);
       if (!canSend || this.isInCooldown(receiverId)) {
         return this.queueOutgoingMessage(receiverId, text);
       }
       if (Bridgefy.sendMeshMessage) {
-        const response = await Bridgefy.sendMeshMessage(receiverId, text);
-        if (response?.id) {
-          this.pendingSendMap.set(response.id, receiverId);
-        }
+        const response = await this._sendSecureDirectText(receiverId, text, true);
         const dbMessage = {
           id: response?.id || `sent_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
           content: text,
@@ -1130,7 +1304,9 @@ class BridgefyService {
       }
       return this.queueOutgoingMessage(receiverId, text);
     } catch (error) {
-      console.error('Mesh send failed:', error);
+      if (error?.code !== 'SECURE_CHANNEL_PENDING') {
+        console.error('Mesh send failed:', error);
+      }
       return this.queueOutgoingMessage(receiverId, text);
     }
   }
@@ -1144,7 +1320,7 @@ class BridgefyService {
         timestamp: Date.now(), isBroadcast: false,
         data: base64Data, width, height,
       });
-      const response = await Bridgefy.sendPayload(receiverId, payload);
+      const response = await this._sendSecureDirectPayload(receiverId, payload, 'photo');
       const dbMsg = this._buildDbMessage({ responseId: response.id, content: payload, receiverId, messageType: 'direct' });
       await databaseService.saveMessage(dbMsg);
       return this._buildAppMessage(dbMsg, { contentType: 'photo', mediaData: { data: base64Data, width, height } });
@@ -1162,7 +1338,7 @@ class BridgefyService {
         senderId: this.myDeviceId, senderName: this.myDeviceName,
         timestamp: Date.now(), isBroadcast: false, lat, lng,
       });
-      const response = await Bridgefy.sendPayload(receiverId, payload);
+      const response = await this._sendSecureDirectPayload(receiverId, payload, 'location');
       const dbMsg = this._buildDbMessage({ responseId: response.id, content: payload, receiverId, messageType: 'direct' });
       await databaseService.saveMessage(dbMsg);
       return this._buildAppMessage(dbMsg, { contentType: 'location', mediaData: { lat, lng } });
@@ -1519,6 +1695,7 @@ class BridgefyService {
     if (!this.myDeviceId || !this.isInitialized) return;
     try {
       const battery = await this._getBattery();
+      const cryptoPublicKey = await cryptoService.getMyPublicKey().catch(() => null);
       this.lastAnnounceAt = Date.now();
       // Battery warning â€” one shot per session when critically low
       if (battery != null && battery <= 15 && !this._batteryWarningSent) {
@@ -1542,6 +1719,7 @@ class BridgefyService {
         name: this.myDeviceName,
         userName: this.myDeviceName,
         battery,
+        cryptoPublicKey,
         timestamp: Date.now(),
       });
       await Bridgefy.sendBroadcast(packet);
@@ -1554,6 +1732,10 @@ class BridgefyService {
 
     // Announce updates mesh metadata only; it must not create direct peers.
     const name = parsed.name || `Device_${senderId.substring(0, 8)}`;
+
+    if (parsed.cryptoPublicKey) {
+      await this._rememberPeerCryptoKey(senderId, parsed.cryptoPublicKey);
+    }
 
     if (parsed.battery != null) this.deviceBatteries.set(senderId, parsed.battery);
     this.deviceLastSeen.set(senderId, parsed.timestamp || Date.now());
@@ -1674,9 +1856,6 @@ class BridgefyService {
 
   setOnLocationUpdated(cb) { this.onLocationUpdated = cb; }
 
-  isBatterySendEnabled() { return this._sendBattery !== false; }
-  setBatterySendEnabled(val) { this._sendBattery = val; }
-
   async getMyBattery() {
     try {
       const { NativeModules } = require('react-native');
@@ -1732,7 +1911,7 @@ class BridgefyService {
     if (isBroadcast) {
       response = await Bridgefy.sendBroadcast(payload);
     } else {
-      response = await Bridgefy.sendPayload(receiverId, payload);
+      response = await this._sendSecureDirectPayload(receiverId, payload, 'find_me_request');
     }
     const dbMsg = this._buildDbMessage({
       responseId: response.id,
@@ -1765,7 +1944,7 @@ class BridgefyService {
       // Original request was broadcast â€” reply via broadcast so mesh can relay it back
       response = await Bridgefy.sendBroadcast(payload);
     } else {
-      response = await Bridgefy.sendPayload(receiverId, payload);
+      response = await this._sendSecureDirectPayload(receiverId, payload, 'find_me_response');
     }
     const dbMsg = this._buildDbMessage({
       responseId: response.id,
@@ -1800,7 +1979,7 @@ class BridgefyService {
       senderName: this.myDeviceName,
       timestamp: Date.now(),
     });
-    const response = await Bridgefy.sendPayload(receiverId, payload);
+    const response = await this._sendSecureDirectPayload(receiverId, payload, 'file');
     const dbMsg = this._buildDbMessage({ responseId: response.id, content: payload, receiverId, messageType: 'direct' });
     await databaseService.saveMessage(dbMsg);
     return this._buildAppMessage(dbMsg, {

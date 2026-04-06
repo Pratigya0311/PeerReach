@@ -233,7 +233,7 @@ const ChatScreen = ({ route, navigation }) => {
       if (stored.length === 0 && !isBroadcast) {
         setMessages([{
           id: `welcome_${Date.now()}`,
-          text: `You are now chatting with ${deviceName}. Messages are end-to-end encrypted.`,
+          text: `You are now chatting with ${deviceName}. Direct messages are encrypted once the secure channel is ready.`,
           senderName: 'System',
           timestamp: Date.now(),
           isMine: false, isBroadcast: false,
@@ -1079,7 +1079,7 @@ const ChatScreen = ({ route, navigation }) => {
                 <Text style={styles.emptySubtext}>
                   {isBroadcast
                     ? 'Messages will be sent to all nearby devices'
-                    : 'Your messages are end-to-end encrypted'}
+                    : 'Direct messages are encrypted once the secure channel is ready'}
                 </Text>
               </View>
             }

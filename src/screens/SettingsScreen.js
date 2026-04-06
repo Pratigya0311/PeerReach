@@ -29,12 +29,10 @@ const SettingsScreen = () => {
 
   const [displayName, setDisplayName]       = useState('');
   const [saving, setSaving]                 = useState(false);
-  const [sendBattery, setSendBattery]       = useState(true);
   const [showSosFindMe, setShowSosFindMe]   = useState(true);
 
   useEffect(() => {
     setDisplayName(BridgefyService.getDisplayName() || '');
-    setSendBattery(BridgefyService.isBatterySendEnabled());
     AsyncStorage.getItem(SHOW_SOS_FINDME_KEY).then(val => {
       if (val !== null) setShowSosFindMe(val !== 'false');
     }).catch(() => {});
@@ -104,21 +102,6 @@ const SettingsScreen = () => {
         <Text style={styles.sectionHeader}>Privacy</Text>
         <View style={styles.card}>
           <View style={styles.switchRow}>
-            <View style={{ flex: 1 }}>
-              <Text style={styles.rowLabel}>Share battery level</Text>
-              <Text style={styles.rowHint}>Include your battery % in messages so others can see if you're running low.</Text>
-            </View>
-            <Switch
-              value={sendBattery}
-              onValueChange={val => {
-                setSendBattery(val);
-                BridgefyService.setBatterySendEnabled(val);
-              }}
-              trackColor={{ false: colors.border, true: colors.primary }}
-              thumbColor="#fff"
-            />
-          </View>
-          <View style={[styles.switchRow, { marginTop: 16 }]}>
             <View style={{ flex: 1 }}>
               <Text style={styles.rowLabel}>Show SOS & Find Me</Text>
               <Text style={styles.rowHint}>Show emergency SOS and Find Me buttons in the chat attach menu.</Text>
