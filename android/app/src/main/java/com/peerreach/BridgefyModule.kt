@@ -26,6 +26,7 @@ class BridgefyModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
     private var isStarting: Boolean = false
     private var deviceName: String = "Unknown Device"
     private var connectedDevices = mutableMapOf<UUID, String>()
+    private val pendingReceiverIds: ArrayDeque<String> = ArrayDeque()
     private var bluetoothReceiver: BroadcastReceiver? = null
 
     init {
@@ -186,14 +187,6 @@ class BridgefyModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
                 if (senderId != null) params.putString("senderId", senderId)
                 if (senderName != null) params.putString("senderName", senderName)
 
-                if (senderId != null && senderName != null) {
-                    try {
-                        connectedDevices[UUID.fromString(senderId)] = senderName
-                    } catch (e: Exception) {
-                        Log.w("BridgefyModule", "Invalid sender ID in message: $senderId")
-                    }
-                }
-
                 addExtraParams(messageData, params)
 
                 val isBroadcast = transmissionMode is TransmissionMode.Broadcast
@@ -247,6 +240,9 @@ class BridgefyModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
 
         override fun onSend(messageID: UUID) {
             Log.i("BridgefyModule", "Message sent: $messageID")
+            if (pendingReceiverIds.isNotEmpty()) {
+                pendingReceiverIds.removeFirst()
+            }
             
             val params = Arguments.createMap()
             params.putString("messageId", messageID.toString())
@@ -259,10 +255,14 @@ class BridgefyModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
 
         override fun onFailToSend(messageID: UUID, error: BridgefyException) {
             Log.e("BridgefyModule", "Failed to send $messageID: ${error.message}")
+            val receiverId = if (pendingReceiverIds.isNotEmpty()) pendingReceiverIds.removeFirst() else null
             
             val params = Arguments.createMap()
             params.putString("messageId", messageID.toString())
             params.putString("error", error.message)
+            if (receiverId != null) {
+                params.putString("receiverId", receiverId)
+            }
             sendEvent("onMessageSendFailed", params)
         }
 
@@ -397,6 +397,7 @@ class BridgefyModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
             )
             val jsonString = JSONObject(messageObject).toString()
             val bytes = jsonString.toByteArray(Charsets.UTF_8)
+            pendingReceiverIds.addLast(receiverId)
             b.send(bytes, TransmissionMode.P2P(receiverUUID))
             val result = Arguments.createMap()
             result.putString("id", UUID.randomUUID().toString())
@@ -439,6 +440,7 @@ class BridgefyModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
             )
             val jsonString = JSONObject(messageObject).toString()
             val bytes = jsonString.toByteArray(Charsets.UTF_8)
+            pendingReceiverIds.addLast(receiverId)
             b.send(bytes, TransmissionMode.Mesh(receiverUUID))
             val result = Arguments.createMap()
             result.putString("id", UUID.randomUUID().toString())
@@ -506,6 +508,7 @@ class BridgefyModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
         try {
             val receiverUUID = UUID.fromString(receiverId)
             val bytes = payload.toByteArray(Charsets.UTF_8)
+            pendingReceiverIds.addLast(receiverId)
             b.send(bytes, TransmissionMode.P2P(receiverUUID))
             val result = Arguments.createMap()
             result.putString("id", UUID.randomUUID().toString())

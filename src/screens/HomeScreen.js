@@ -52,7 +52,7 @@ const HomeScreen = ({ navigation }) => {
   const [nearbyPeers, setNearbyPeers]         = useState([]);
   const [myBattery, setMyBattery]             = useState(null);
   const [permissionsGranted, setPermissionsGranted] = useState(false);
-  const [firstRunPending, setFirstRunPending] = useState(true);
+  const [firstRunPending, setFirstRunPending] = useState(null);
   const [hasNetwork, setHasNetwork]           = useState(true);
   const networkAlertedRef = useRef(false);
   const [showDebug, setShowDebug]             = useState(false);
@@ -124,13 +124,13 @@ const HomeScreen = ({ navigation }) => {
   }, []);
 
   useEffect(() => {
-    AsyncStorage.getItem('@peerreach_first_run_done')
+    AsyncStorage.getItem(BRIDGEFY_EVER_INIT_KEY)
       .then((value) => setFirstRunPending(!value))
       .catch(() => setFirstRunPending(true));
   }, []);
 
   useEffect(() => {
-    if (!NetInfo) return;
+    if (!NetInfo || firstRunPending == null) return;
     const unsubscribe = NetInfo.addEventListener((state) => {
       const connected = !!state.isConnected;
       setHasNetwork(connected);
@@ -151,10 +151,15 @@ const HomeScreen = ({ navigation }) => {
   }, [firstRunPending]);
 
   useEffect(() => {
+    if (firstRunPending == null) return;
     if (!permissionsGranted) return;
-    if (firstRunPending && !hasNetwork) return;
+    if (firstRunPending) {
+      if (!hasNetwork) return;
+      initializeBridgefy();
+      return;
+    }
     initializeBridgefy();
-  }, [permissionsGranted, firstRunPending, hasNetwork]);
+  }, [permissionsGranted, firstRunPending]);
 
   // Light debug log refresh (no heavy logging)
   useEffect(() => {
@@ -176,6 +181,13 @@ const HomeScreen = ({ navigation }) => {
 
   const initializeBridgefy = async () => {
     try {
+      if (BridgefyService.isInitialized && BridgefyService.myDeviceId) {
+        handleBridgefyReady({
+          deviceId: BridgefyService.myDeviceId,
+          deviceName: BridgefyService.myDeviceName || BridgefyService.getDisplayName?.() || 'Unknown',
+        });
+        return;
+      }
       setBridgefyStatus('initializing');
       console.log('🚀 Initializing Bridgefy...');
       const API_KEY = getBridgefyKey();
@@ -226,8 +238,8 @@ const HomeScreen = ({ navigation }) => {
     setMyDeviceName(data.deviceName);
     setBridgefyStatus('ready');
     setIsLoading(false);
-    AsyncStorage.setItem('@peerreach_first_run_done', '1').catch(() => {});
     AsyncStorage.setItem(BRIDGEFY_EVER_INIT_KEY, '1').catch(() => {});
+    setFirstRunPending(false);
     loadData().catch(err => console.error('Error loading data on ready:', err));
     // Show cached weather immediately, then get live updates via WeatherService
     const cached = weatherService.getData();

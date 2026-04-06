@@ -34,9 +34,12 @@ const DevicesScreen = ({ navigation }) => {
         BridgefyService.getReachableUsers(),
         BridgefyService.getMyDeviceId(),
       ]);
-      const direct = deviceList.filter(d => d.id !== myId);
-      const directIds = new Set(direct.map(d => d.id));
-      const meshOnly = (reachableList || []).filter(d => d.id !== myId && !directIds.has(d.id));
+      const normalizeId = (id) => String(id || '').trim().toLowerCase();
+      const direct = deviceList.filter(d => normalizeId(d.id) !== normalizeId(myId));
+      const directIds = new Set(direct.map(d => normalizeId(d.id)));
+      const meshOnly = (reachableList || []).filter(
+        d => normalizeId(d.id) !== normalizeId(myId) && !directIds.has(normalizeId(d.id))
+      );
       setNearby(direct);
       setReachable(meshOnly);
       if (BridgefyService.getScanHealth) {
@@ -112,6 +115,7 @@ const DevicesScreen = ({ navigation }) => {
       deviceId:   device.id,
       deviceName: device.name,
       isBroadcast: false,
+      isMesh: !device.isNearby,
     });
   };
 

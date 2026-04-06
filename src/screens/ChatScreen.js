@@ -32,18 +32,11 @@ import { SHOW_SOS_FINDME_KEY } from '../constants/storageKeys';
 // Max base64 length (~45 KB raw image → ~60 KB base64) to stay within Bridgefy's 64 KB limit
 const MAX_BASE64_LENGTH = 61440;
 
-// Max base64 for file transfers (~30 KB raw)
-const MAX_FILE_BASE64 = 40960;
-
-// Conditionally import document picker (install: npm install react-native-document-picker)
-let DocumentPicker = null;
-try { DocumentPicker = require('react-native-document-picker').default; } catch (_e) { /* not installed */ }
-
 // Module-level so it isn't recreated on every render
 const URL_REGEX = /https?:\/\/[^\s]+/gi;
 
 const ChatScreen = ({ route, navigation }) => {
-  const { deviceId, deviceName, isBroadcast = false } = route.params || {};
+  const { deviceId, deviceName, isBroadcast = false, isMesh = false } = route.params || {};
   const colors = useTheme();
   const styles = useMemo(() => makeStyles(colors), [colors]);
   const insets = useSafeAreaInsets();
@@ -58,7 +51,7 @@ const ChatScreen = ({ route, navigation }) => {
   const [typingUser, setTypingUser]         = useState(null);   // senderName string
   const [showScrollBtn, setShowScrollBtn]   = useState(false);
   const [isDeviceOnline, setIsDeviceOnline] = useState(true);
-  const [isMeshReachable, setIsMeshReachable] = useState(false);
+  const [isMeshReachable, setIsMeshReachable] = useState(!!isMesh);
   const [showAttachMenu, setShowAttachMenu] = useState(false);
   const [peerBattery, setPeerBattery]       = useState(null);
   const [msgInfo, setMsgInfo]               = useState(null); // message whose delivery info panel is open
@@ -400,7 +393,9 @@ const ChatScreen = ({ route, navigation }) => {
       setReplyTo(null);
       const sent = isBroadcast
         ? await BridgefyService.sendBroadcast(text, currentReply)
-        : await BridgefyService.sendMessage(deviceId, text, currentReply);
+        : isMeshReachable
+          ? await BridgefyService.sendMeshMessage(deviceId, text, currentReply)
+          : await BridgefyService.sendMessage(deviceId, text, currentReply);
       addMessage(sent);
       setInputText('');
     } catch (error) {
@@ -411,49 +406,6 @@ const ChatScreen = ({ route, navigation }) => {
   };
 
   // ─── Send file ────────────────────────────────────────────────────────────
-  const pickAndSendFile = async () => {
-    if (isSending) return;
-    if (!DocumentPicker) {
-      Alert.alert(
-        'File sharing unavailable',
-        'The document picker package is not compatible with this React Native version yet.'
-      );
-      return;
-    }
-    try {
-      const result = await DocumentPicker.pickSingle({ type: [DocumentPicker.types.allFiles] });
-      const { uri, name: fileName, size: fileSize, type: mimeType } = result;
-      // Read file as base64 via XHR
-      const base64 = await new Promise((resolve, reject) => {
-        const xhr = new XMLHttpRequest();
-        xhr.onload = () => {
-          const reader = new FileReader();
-          reader.onloadend = () => resolve(reader.result.split(',')[1]);
-          reader.onerror  = reject;
-          reader.readAsDataURL(xhr.response);
-        };
-        xhr.onerror = reject;
-        xhr.open('GET', uri);
-        xhr.responseType = 'blob';
-        xhr.send();
-      });
-      if (base64.length > MAX_FILE_BASE64) {
-        Alert.alert('File too large', `Max ~30 KB. This file is ~${Math.round(base64.length * 0.75 / 1024)} KB.`);
-        return;
-      }
-      setIsSending(true);
-      const sent = isBroadcast
-        ? await BridgefyService.sendBroadcastFile(fileName, mimeType, base64, fileSize)
-        : await BridgefyService.sendFile(deviceId, fileName, mimeType, base64, fileSize);
-      addMessage(sent);
-    } catch (err) {
-      if (DocumentPicker.isCancel(err)) return; // user cancelled
-      Alert.alert('File send failed', err.message || 'Unknown error');
-    } finally {
-      setIsSending(false);
-    }
-  };
-
   // ─── Send SOS (always broadcasts to all nearby devices) ──────────────────
   const sendSOS = () => {
     Alert.alert(
@@ -552,6 +504,10 @@ const ChatScreen = ({ route, navigation }) => {
   // ─── Send photo ───────────────────────────────────────────────────────────
   const pickAndSendPhoto = async () => {
     if (isSending) return;
+    if (!isBroadcast && isMeshReachable) {
+      Alert.alert('Mesh only supports text', 'Move closer to send photos directly.');
+      return;
+    }
     try {
       const result = await launchImageLibrary({
         mediaType: 'photo', maxWidth: 600, maxHeight: 600,
@@ -579,6 +535,10 @@ const ChatScreen = ({ route, navigation }) => {
   // ─── Send location ────────────────────────────────────────────────────────
   const shareLocation = async () => {
     if (isSending) return;
+    if (!isBroadcast && isMeshReachable) {
+      Alert.alert('Mesh only supports text', 'Move closer to share location directly.');
+      return;
+    }
     try {
       if (!await requestLocationPermission('Location permission is required to share your location.')) return;
       setIsSending(true);
@@ -1176,10 +1136,6 @@ const ChatScreen = ({ route, navigation }) => {
                 <Text style={styles.attachPanelLabel}>Find Me</Text>
               </TouchableOpacity>
             )}
-            <TouchableOpacity style={styles.attachPanelBtn} onPress={() => { setShowAttachMenu(false); pickAndSendFile(); }}>
-              <View style={[styles.attachPanelIcon, { backgroundColor: '#E65100' }]}><Icon name="attach-file" size={20} color="#fff" /></View>
-              <Text style={styles.attachPanelLabel}>File</Text>
-            </TouchableOpacity>
             <TouchableOpacity style={styles.attachPanelBtn} onPress={() => { setShowAttachMenu(false); shareLocation(); }}>
               <View style={[styles.attachPanelIcon, { backgroundColor: '#2E7D32' }]}><Icon name="place" size={20} color="#fff" /></View>
               <Text style={styles.attachPanelLabel}>Location</Text>

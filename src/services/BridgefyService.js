@@ -17,11 +17,6 @@ const bridgefyEmitter = Bridgefy ? new NativeEventEmitter(Bridgefy) : { addListe
 
 const ANNOUNCE_INTERVAL_MS = 90000;
 const ANNOUNCE_TTL_MS = 180000;
-const DIRECT_TTL_MS = 15000;
-const DIRECT_FRESH_MS = 12000;
-const DIRECT_SCAN_FRESH_MS = 20000;
-const DIRECT_MIN_NEARBY_MS = 30000;
-const DIRECT_SEND_TTL_MS = 5000;
 const MAX_HOPS = 5;
 
 class BridgefyService {
@@ -48,21 +43,22 @@ class BridgefyService {
     this.healthTimer = null;
     this.isRestarting = false;
     this.watchdogTimer = null;
+    this.healthMissCount = 0;
+    this.backgroundOfflineTimer = null;
     this._lastNoPeersLogAt = 0;
     this._emptyListTimer = null;
-    this.directCache = new Map(); // deviceId -> { name, lastSeen }
-    this.directActivity = new Map(); // deviceId -> last direct send/receive ts
-    this.directStickyUntil = new Map(); // deviceId -> timestamp (minimum nearby window)
     this.lastAnnounceAt = 0;
-    this.lastDirectScanAt = 0;
     this.myDeviceName = Platform.OS === 'android' ? (Bridgefy?.deviceName || 'Android Device') : 'iOS Device';
     this.isInitialized = false;
     this.isInitializing = false;
     this.currentChatId = null;
-    this._deviceLostTimers = new Map();  // deviceId â†’ setTimeout handle (grace-period before removal)
     this._debugLog = [];
     this._debugLogMax = 80;
     this._lastDebugAt = 0;
+    this._inflightQueued = new Set();
+    this._recentQueued = new Map();
+    this._lastFailureLogAt = new Map();
+    this._postInitDirectRefreshTimers = [];
 
     // Handlers for special events
     this.onFindMeUpdateHandler = null;
@@ -111,7 +107,60 @@ class BridgefyService {
     return this._debugLog.slice(-this._debugLogMax);
   }
 
-    setupEventListeners() {
+  _isFallbackPeerName(name, id) {
+    const value = String(name || '').trim();
+    if (!value) return true;
+    if (id && value === `Device_${String(id).substring(0, 8)}`) return true;
+    return /^device_[a-f0-9-]{4,}$/i.test(value);
+  }
+
+  async _resolvePeerName(id, candidateName = null) {
+    const fallbackName = `Device_${String(id).substring(0, 8)}`;
+    const trimmedCandidate = String(candidateName || '').trim();
+
+    try {
+      const knownUser = await databaseService.getKnownUser(id);
+      if (knownUser?.name && !this._isFallbackPeerName(knownUser.name, id)) {
+        return knownUser.name;
+      }
+    } catch (_e) {}
+
+    const existingName = this.connectedDevices.get(id);
+    if (existingName && !this._isFallbackPeerName(existingName, id)) {
+      return existingName;
+    }
+
+    if (trimmedCandidate) {
+      return trimmedCandidate;
+    }
+
+    return fallbackName;
+  }
+
+  _clearPostInitDirectRefreshTimers() {
+    this._postInitDirectRefreshTimers.forEach((timer) => clearTimeout(timer));
+    this._postInitDirectRefreshTimers = [];
+  }
+
+  _schedulePostInitDirectRefresh() {
+    this._clearPostInitDirectRefreshTimers();
+    const refreshDelays = [1500, 5000];
+    refreshDelays.forEach((delay) => {
+      const timer = setTimeout(async () => {
+        try {
+          await this.getConnectedDevices();
+          this.emitEvent('onDeviceListUpdated', {
+            devices: Array.from(this.connectedDevices.entries()).map(([id, name]) => ({ id, name }))
+          });
+        } catch (error) {
+          this._pushDebug('post_init_direct_refresh_error', { delay, error: error?.message || error });
+        }
+      }, delay);
+      this._postInitDirectRefreshTimers.push(timer);
+    });
+  }
+
+  setupEventListeners() {
     // Registration events
     bridgefyEmitter.addListener('onRegistrationSuccessful', async (data) => {
       try {
@@ -122,6 +171,7 @@ class BridgefyService {
         const saved = await AsyncStorage.getItem(DISPLAY_NAME_KEY).catch(() => null);
         this.myDeviceName = (saved && saved.trim()) ? saved.trim() : hwName;
         this.isInitialized = true;
+        this.healthMissCount = 0;
         gatewayService.setMyDeviceId(this.myDeviceId);
         weatherService.setMyDeviceId(this.myDeviceId);
         await databaseService.saveDevice({
@@ -134,8 +184,8 @@ class BridgefyService {
         this.flushQueuedMessages();
         this.flushQueuedBroadcasts();
         this.startHealthCheck();
+        this._schedulePostInitDirectRefresh();
         this.emitEvent('onReady', { deviceId: this.myDeviceId, deviceName: this.myDeviceName });
-        weatherService.startAutoRefresh();
         this._startLocationTracking();
       } catch (err) {
         console.error('onRegistrationSuccessful error:', err);
@@ -155,25 +205,13 @@ class BridgefyService {
         const id = device?.userId || device?.id;
         const name = device?.deviceName || device?.name;
         if (id) {
-          if (this._deviceLostTimers.has(id)) {
-            clearTimeout(this._deviceLostTimers.get(id));
-            this._deviceLostTimers.delete(id);
-            console.log('Reconnected within grace period - removal cancelled:', id);
-          }
-          const existing = this.connectedDevices.get(id);
-          const resolvedName = existing || name || `Device_${id.substring(0, 8)}`;
+          const resolvedName = await this._resolvePeerName(id, name);
           this.connectedDevices.set(id, resolvedName);
-          this.lastDirectScanAt = Date.now();
-          this.deviceLastSeen.set(id, Date.now());
-          this.directCache.set(id, { name: resolvedName, lastSeen: Date.now() });
-          this.directActivity.set(id, Date.now());
-          this.directStickyUntil.set(id, Date.now() + DIRECT_MIN_NEARBY_MS);
           this.offlineBlocked.delete(id);
           await databaseService.saveDevice({
             id: id,
             name: resolvedName,
-            connection_status: 'online',
-            last_seen: Date.now(),
+            connection_status: 'online'
           });
           this.sendAnnounce('online', 0);
           await this.flushQueuedMessages(id);
@@ -185,63 +223,35 @@ class BridgefyService {
       }
     });
 
-    bridgefyEmitter.addListener('onDeviceLost', (device) => {
-      console.log('Device lost (grace period started):', device);
+    bridgefyEmitter.addListener('onDeviceLost', async (device) => {
+      console.log('Device lost:', device);
       const id = device?.userId || device?.id;
-      if (!id) return;
-      if (this._deviceLostTimers.has(id)) return;
-      const timer = setTimeout(async () => {
-        this._deviceLostTimers.delete(id);
-        if (this.connectedDevices.has(id)) {
-          console.log('Device confirmed lost after grace period:', id);
-          this.connectedDevices.delete(id);
-          this.directCache.delete(id);
-          this.directActivity.delete(id);
-          this.directStickyUntil.delete(id);
-          try {
-            await databaseService.updateDeviceStatus(id, 'offline');
-          } catch (err) {
-            console.error('onDeviceLost DB update error:', err);
-          }
-          this.emitEvent('onDeviceLost', device);
-        }
-      }, 8000);
-      this._deviceLostTimers.set(id, timer);
+      if (id) {
+        this.connectedDevices.delete(id);
+        this.offlineBlocked.add(id);
+        await databaseService.updateDeviceStatus(id, 'offline');
+        await databaseService.markKnownUsersStaleByViaPeer(id);
+        this.emitEvent('onDeviceLost', device);
+      }
     });
 
     bridgefyEmitter.addListener('onDeviceListUpdated', async (data) => {
       try {
         console.log('Device list updated:', data?.devices?.length);
         if (data?.devices && Array.isArray(data.devices)) {
-          this.lastDirectScanAt = Date.now();
-          // Do not clear on empty or partial lists — membership is managed by onDeviceConnected/onDeviceLost.
-          const nextMap = new Map();
           for (const device of data.devices) {
             const id = device?.userId || device?.id;
             const name = device?.deviceName || device?.name;
             if (id) {
-              nextMap.set(id, name || `Device_${id.substring(0, 8)}`);
+              const resolvedName = await this._resolvePeerName(id, name);
+              this.connectedDevices.set(id, resolvedName);
+              this.offlineBlocked.delete(id);
+              await databaseService.saveDevice({
+                id: id,
+                name: resolvedName,
+                connection_status: 'online'
+              });
             }
-          }
-          if (nextMap.size === 0) {
-            this.emitEvent('onDeviceListUpdated', {
-              devices: Array.from(this.connectedDevices.entries()).map(([id, name]) => ({ id, name }))
-            });
-            return;
-          }
-          // Merge updates; do not drop missing devices here (onDeviceLost handles removal)
-          for (const [id, name] of nextMap.entries()) {
-            this.connectedDevices.set(id, name);
-            this.offlineBlocked.delete(id);
-            await databaseService.saveDevice({
-              id: id,
-              name: name,
-              connection_status: 'online'
-            });
-            this.deviceLastSeen.set(id, Date.now());
-            this.directCache.set(id, { name, lastSeen: Date.now() });
-            this.directActivity.set(id, Date.now());
-            this.directStickyUntil.set(id, Date.now() + DIRECT_MIN_NEARBY_MS);
           }
           await this.flushQueuedBroadcasts();
           this.emitEvent('onDeviceListUpdated', {
@@ -274,32 +284,30 @@ class BridgefyService {
     bridgefyEmitter.addListener('onMessageSent', (data) => {
       console.log('Message sent:', data);
       if (data?.messageId) {
-        const rid = this.pendingSendMap.get(data.messageId);
-        if (rid) this.directActivity.set(rid, Date.now());
         this.pendingSendMap.delete(data.messageId);
       }
       this.emitEvent('onMessageSent', data);
     });
 
     bridgefyEmitter.addListener('onMessageSendFailed', (error) => {
-      const errMsg = error?.error || error?.message || '';
-      if (this._isNoPeersError(errMsg)) {
-        const now = Date.now();
-        if (now - this._lastNoPeersLogAt > 2000) {
-          console.warn('Send failed (no peers):', errMsg);
-          this._lastNoPeersLogAt = now;
-        }
-      } else {
-        console.warn('Message send failed:', error);
-      }
+      const rawMessage = error?.error || error?.message || '';
+      const isTransient = this._isTransientSendFailure(rawMessage);
       const receiverId = error?.receiverId || (error?.messageId ? this.pendingSendMap.get(error.messageId) : null);
-      if (receiverId) {
-        if (!this._isNoPeersError(errMsg)) {
-          this.applySendFailure(receiverId);
+      const failureKey = `${receiverId || 'unknown'}:${isTransient ? 'transient' : 'hard'}`;
+      const lastLoggedAt = this._lastFailureLogAt.get(failureKey) || 0;
+      if (Date.now() - lastLoggedAt > 5000) {
+        if (isTransient) {
+          console.warn('Message send deferred:', error);
+        } else {
+          console.error('Message send failed:', error);
         }
+        this._lastFailureLogAt.set(failureKey, Date.now());
+      }
+      if (receiverId) {
+        this.applySendFailure(receiverId);
         this.sendCooldowns.set(receiverId, Date.now() + 60000);
       }
-      if (!this._isNoPeersError(errMsg)) {
+      if (!isTransient) {
         this.sendAnnounce('online', 0);
         this.ensureHealth();
       }
@@ -399,9 +407,6 @@ class BridgefyService {
 
       const messageType = isBroadcast ? 'broadcast' : 'direct';
       const senderId = rawMessage.senderId || 'unknown';
-      if (!isBroadcast && senderId && senderId !== 'unknown') {
-        this.directActivity.set(senderId, Date.now());
-      }
       // Prefer stored display name (set via announce) over SDK hardware name
       const senderName = this.connectedDevices.get(senderId) || rawMessage.senderName || 'Unknown Device';
 
@@ -570,6 +575,7 @@ class BridgefyService {
         text: '',
         userId: this.myDeviceId,
         userName: this.myDeviceName,
+        name: this.myDeviceName,
         status: status,
         hop: hop,
         announceId: announceId,
@@ -616,10 +622,6 @@ class BridgefyService {
         await this.flushQueuedMessages(userId);
       } else {
         this.offlineBlocked.add(userId);
-        this.connectedDevices.delete(userId);
-        this.directCache.delete(userId);
-        this.directActivity.delete(userId);
-        this.directStickyUntil?.delete?.(userId);
       }
 
       if (distance < MAX_HOPS) {
@@ -648,18 +650,34 @@ class BridgefyService {
     return until && Date.now() < until;
   }
 
+  _isTransientSendFailure(message) {
+    const msg = String(message || '').toLowerCase();
+    return (
+      msg.includes('no peers') ||
+      msg.includes('transaction canceled') ||
+      msg.includes('transaction cancelled') ||
+      msg.includes('timed out') ||
+      msg.includes('standalonecoroutine was cancelled') ||
+      msg.includes('canceled') ||
+      msg.includes('cancelled')
+    );
+  }
+
+  _getRecentQueueHit(key, windowMs = 5000) {
+    const hit = this._recentQueued.get(key);
+    if (!hit) return null;
+    if (Date.now() - hit.ts > windowMs) {
+      this._recentQueued.delete(key);
+      return null;
+    }
+    return hit.message;
+  }
+
   applySendFailure(receiverId) {
-    const cachedName =
-      this.connectedDevices.get(receiverId) ||
-      this.directCache.get(receiverId)?.name ||
-      'Unknown Device';
     this.offlineBlocked.add(receiverId);
-    this.connectedDevices.delete(receiverId);
-    this.directCache.delete(receiverId);
-    this.directActivity.delete(receiverId);
     databaseService.upsertKnownUser({
       id: receiverId,
-      name: cachedName,
+      name: this.connectedDevices.get(receiverId) || 'Unknown Device',
       last_seen: Date.now(),
       hops: 0,
       via_peer: null,
@@ -667,30 +685,78 @@ class BridgefyService {
     }).catch(() => {});
   }
 
-  async queueOutgoingMessage(receiverId, text, replyTo = null) {
-    const dbMsg = this._buildDbMessage({
+  async queueOutgoingMessage(receiverId, text) {
+    const dedupeKey = `direct:${receiverId}:${text}`;
+    const existing = this._getRecentQueueHit(dedupeKey);
+    if (existing) {
+      return existing;
+    }
+    const dbMessage = {
+      id: `queued_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
       content: text,
-      receiverId,
-      messageType: 'direct',
-      replyToId: replyTo?.id || null,
-      replyPreview: replyTo ? `${replyTo.senderName}: ${replyTo.text}` : null,
-    });
-    dbMsg.delivery_status = 'queued';
-    await databaseService.saveMessage(dbMsg);
-    return this._buildAppMessage(dbMsg);
+      sender_id: this.myDeviceId,
+      sender_name: this.myDeviceName,
+      receiver_id: receiverId,
+      message_type: 'direct',
+      is_mine: true,
+      is_broadcast: false,
+      timestamp: Date.now(),
+      read_status: 1,
+      delivery_status: 'queued'
+    };
+    await databaseService.saveMessage(dbMessage);
+    const message = {
+      id: dbMessage.id,
+      text: text,
+      senderId: this.myDeviceId,
+      senderName: this.myDeviceName,
+      receiverId: receiverId,
+      timestamp: Date.now(),
+      isMine: true,
+      isBroadcast: false,
+      type: 'text',
+      read: true,
+      deliveryStatus: 'queued'
+    };
+    this._recentQueued.set(dedupeKey, { ts: Date.now(), message });
+    return message;
   }
 
-  async queueBroadcastMessage(text, replyTo = null) {
-    const dbMsg = this._buildDbMessage({
+  async queueBroadcastMessage(text) {
+    const dedupeKey = `broadcast_failed:${text}`;
+    const existing = this._getRecentQueueHit(dedupeKey);
+    if (existing) {
+      return existing;
+    }
+    const dbMessage = {
+      id: `broadcast_failed_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
       content: text,
-      messageType: 'broadcast',
+      sender_id: this.myDeviceId,
+      sender_name: this.myDeviceName,
+      receiver_id: null,
+      message_type: 'broadcast',
+      is_mine: true,
+      is_broadcast: true,
+      timestamp: Date.now(),
+      read_status: 1,
+      delivery_status: 'failed'
+    };
+    await databaseService.saveMessage(dbMessage);
+    const message = {
+      id: dbMessage.id,
+      text: text,
+      senderId: this.myDeviceId,
+      senderName: this.myDeviceName,
+      receiverId: null,
+      timestamp: Date.now(),
+      isMine: true,
       isBroadcast: true,
-      replyToId: replyTo?.id || null,
-      replyPreview: replyTo ? `${replyTo.senderName}: ${replyTo.text}` : null,
-    });
-    dbMsg.delivery_status = 'queued';
-    await databaseService.saveMessage(dbMsg);
-    return this._buildAppMessage(dbMsg);
+      type: 'text',
+      read: true,
+      deliveryStatus: 'failed'
+    };
+    this._recentQueued.set(dedupeKey, { ts: Date.now(), message });
+    return message;
   }
 
   startHealthCheck() {
@@ -744,6 +810,11 @@ class BridgefyService {
       if (!this.isInitialized || !this.lastApiKey) return;
       const id = await this.getMyDeviceId();
       if (!id || id === 'initializing...') {
+        this.healthMissCount += 1;
+        this._pushDebug('health_miss', { count: this.healthMissCount, id });
+        if (this.healthMissCount < 3) {
+          return;
+        }
         this.isRestarting = true;
         this.emitEvent('onReconnecting', { reason: 'health-check' });
         await Bridgefy.stop();
@@ -754,7 +825,10 @@ class BridgefyService {
         this.flushQueuedMessages();
         this.flushQueuedBroadcasts();
         this.isRestarting = false;
+        this.healthMissCount = 0;
         this.emitEvent('onReconnected', {});
+      } else {
+        this.healthMissCount = 0;
       }
     } catch (error) {
       this.isRestarting = false;
@@ -762,14 +836,7 @@ class BridgefyService {
   }
 
   async sendDirectRaw(receiverId, text) {
-    const battery = await this._getBattery();
-    const envelope = JSON.stringify({
-      type: 'text', text,
-      senderId: this.myDeviceId,
-      senderName: this.myDeviceName,
-      _bat: battery,
-    });
-    const response = await Bridgefy.sendPayload(receiverId, envelope);
+    const response = await Bridgefy.sendMessage(receiverId, text);
     if (response?.id) {
       this.pendingSendMap.set(response.id, receiverId);
     }
@@ -777,21 +844,14 @@ class BridgefyService {
   }
 
   async sendMeshRaw(receiverId, text) {
-    const battery = await this._getBattery();
-    const envelope = JSON.stringify({
-      type: 'text', text,
-      senderId: this.myDeviceId,
-      senderName: this.myDeviceName,
-      _bat: battery,
-    });
-    if (Bridgefy.sendMeshMessage) {
-      const response = await Bridgefy.sendMeshMessage(receiverId, envelope);
-      if (response?.id) {
-        this.pendingSendMap.set(response.id, receiverId);
-      }
-      return response;
+    if (!Bridgefy.sendMeshMessage) {
+      throw new Error('Mesh send not available');
     }
-    return this.sendDirectRaw(receiverId, text);
+    const response = await Bridgefy.sendMeshMessage(receiverId, text);
+    if (response?.id) {
+      this.pendingSendMap.set(response.id, receiverId);
+    }
+    return response;
   }
 
   async flushQueuedMessages(receiverId = null) {
@@ -809,27 +869,15 @@ class BridgefyService {
         }
         await databaseService.updateMessageStatus(msg.id, 'sent');
       } catch (error) {
-        const errMsg = error?.error || error?.message || '';
-        if (!this._isNoPeersError(errMsg)) {
-          this.applySendFailure(msg.receiverId);
-        }
-        this.sendCooldowns.set(msg.receiverId, Date.now() + 60000);
-        if (this._isNoPeersError(errMsg)) break;
+        this.applySendFailure(msg.receiverId);
       }
     }
   }
 
   async flushQueuedBroadcasts() {
-    if (this._getDirectListFromCache({ freshOnly: true }).length === 0) return;
-    const queued = await databaseService.getQueuedBroadcastMessages();
-    for (const msg of queued) {
-      try {
-        await Bridgefy.sendBroadcast(msg.text);
-        await databaseService.updateMessageStatus(msg.id, 'sent');
-      } catch (error) {
-        break;
-      }
-    }
+    // Broadcasts are intentionally not retried. We keep them fire-and-forget
+    // so a device entering range later does not receive a backlog burst.
+    return;
   }
   showNotification(message) {
     const preview = (message.text || `[${message.contentType || 'message'}]`).substring(0, 50);
@@ -838,6 +886,10 @@ class BridgefyService {
 
   handleAppStateChange(nextState) {
     if (nextState === 'active') {
+      if (this.backgroundOfflineTimer) {
+        clearTimeout(this.backgroundOfflineTimer);
+        this.backgroundOfflineTimer = null;
+      }
       this.getUnreadCounts()
         .then(counts => this.emitEvent('onUnreadUpdated', counts))
         .catch(err => console.error('getUnreadCounts error:', err));
@@ -848,97 +900,25 @@ class BridgefyService {
         this.flushQueuedBroadcasts();
         this.startHealthCheck();
       }
-      this.startWatchdog();
       return;
     }
 
     if (nextState === 'background' || nextState === 'inactive') {
-      if (this.isInitialized) {
-        this.sendAnnounce('offline', 0);
-        this.stopAnnounceLoop();
-        this.stopHealthCheck();
+      if (this.backgroundOfflineTimer) {
+        clearTimeout(this.backgroundOfflineTimer);
       }
-      this.stopWatchdog();
+      this.backgroundOfflineTimer = setTimeout(() => {
+        this.backgroundOfflineTimer = null;
+        if (this.isInitialized) {
+          this.sendAnnounce('offline', 0);
+          this.stopAnnounceLoop();
+          this.stopHealthCheck();
+        }
+      }, 10000);
       if (this.currentChatId !== null) {
         this.currentChatId = null;
       }
     }
-  }
-
-  // ============ PRIVATE HELPERS ============
-
-  _isNoPeersError(message) {
-    const msg = String(message || '').toLowerCase();
-    return (
-      msg.includes('no peers') ||
-      msg.includes('transaction canceled') ||
-      msg.includes('transaction cancelled') ||
-      msg.includes('timed out')
-    );
-  }
-
-  _withTimeout(promise, ms) {
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('send_timeout')), ms);
-      promise
-        .then((res) => { clearTimeout(timer); resolve(res); })
-        .catch((err) => { clearTimeout(timer); reject(err); });
-    });
-  }
-
-  _isDirectFresh(deviceId) {
-    const info = this.directCache.get(deviceId);
-    if (!info || this.offlineBlocked.has(deviceId)) return false;
-    if (!this.lastDirectScanAt || Date.now() - this.lastDirectScanAt > DIRECT_SCAN_FRESH_MS) {
-      return false;
-    }
-    const lastSeen = info.lastSeen || 0;
-    const stickyUntil = this.directStickyUntil.get(deviceId) || 0;
-    if (stickyUntil > Date.now()) return true;
-    if (Date.now() - lastSeen > DIRECT_TTL_MS) return false;
-    const lastActivity = this.directActivity.get(deviceId) || lastSeen;
-    return Date.now() - lastActivity <= DIRECT_FRESH_MS;
-  }
-
-  _getDirectListFromCache({ freshOnly = true } = {}) {
-    if (freshOnly && (!this.lastDirectScanAt || Date.now() - this.lastDirectScanAt > DIRECT_SCAN_FRESH_MS)) {
-      return [];
-    }
-    const now = Date.now();
-    const result = [];
-    for (const [id, info] of this.directCache.entries()) {
-      if (!id || id === this.myDeviceId) continue;
-      if (!info?.lastSeen || now - info.lastSeen > DIRECT_TTL_MS) continue;
-      if (this.offlineBlocked.has(id)) continue;
-      if (freshOnly && !this._isDirectFresh(id)) continue;
-      result.push({
-        id,
-        name: info.name,
-        battery: this.deviceBatteries.get(id) ?? null,
-        lastSeen: info.lastSeen ?? null,
-      });
-    }
-    return result;
-  }
-
-  getStaleDirectDevices() {
-    const now = Date.now();
-    const result = [];
-    for (const [id, info] of this.directCache.entries()) {
-      if (!id || id === this.myDeviceId) continue;
-      if (this.offlineBlocked.has(id)) continue;
-      if (!info?.lastSeen || now - info.lastSeen > DIRECT_TTL_MS) continue;
-      const last = this.directActivity.get(id) || info.lastSeen || 0;
-      if (now - last <= DIRECT_FRESH_MS) continue;
-      result.push({
-        id,
-        name: info.name,
-        battery: this.deviceBatteries.get(id) ?? null,
-        lastSeen: info.lastSeen ?? null,
-        hops: 1,
-      });
-    }
-    return result;
   }
 
   // Builds the DB row for any outbound message.
@@ -1009,7 +989,11 @@ class BridgefyService {
     console.log('Initializing Bridgefy with SQLite...');
     if (!Bridgefy) throw new Error('Bridgefy native module not loaded. Check that the AAR is properly linked.');
     try {
-      if (this.isInitialized || this.isInitializing) {
+      if (this.isInitialized) {
+        this.emitEvent('onReady', { deviceId: this.myDeviceId, deviceName: this.myDeviceName });
+        return true;
+      }
+      if (this.isInitializing) {
         return true;
       }
       this.isInitializing = true;
@@ -1055,36 +1039,99 @@ class BridgefyService {
     }
   }
 
-  async sendMessage(receiverId, text, replyTo = null) {
-    if (!this.myDeviceId) throw new Error('Mesh not ready — please wait for initialization');
-    const canSend = await this.isReceiverOnline(receiverId);
-    if (!canSend || this.isInCooldown(receiverId)) {
-      return this.queueOutgoingMessage(receiverId, text, replyTo);
-    }
+  async sendMessage(receiverId, text, _replyTo = null) {
     try {
-      const response = await this._withTimeout(
-        this.isDirectDevice(receiverId)
-          ? this.sendDirectRaw(receiverId, text)
-          : this.sendMeshRaw(receiverId, text),
-        12000
-      );
-      const dbMsg = this._buildDbMessage({
-        responseId: response?.id,
-        content: text,
-        receiverId,
-        messageType: 'direct',
-        replyToId: replyTo?.id || null,
-        replyPreview: replyTo ? `${replyTo.senderName}: ${replyTo.text}` : null,
-      });
-      dbMsg.delivery_status = 'sent';
-      await databaseService.saveMessage(dbMsg);
-      return this._buildAppMessage(dbMsg);
-    } catch (error) {
-      if (String(error?.message || '') === 'send_timeout') {
-        return this.queueOutgoingMessage(receiverId, text, replyTo);
+      console.log(`📤 Sending to ${receiverId}: ${text}`);
+      const canSend = await this.isReceiverOnline(receiverId);
+      if (!canSend || this.isInCooldown(receiverId)) {
+        return this.queueOutgoingMessage(receiverId, text);
       }
+      const response = await Bridgefy.sendMessage(receiverId, text);
+      if (response?.id) {
+        this.pendingSendMap.set(response.id, receiverId);
+      }
+      
+      // Create database message
+      const dbMessage = {
+        id: response?.id || `sent_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        content: text,
+        sender_id: this.myDeviceId,
+        sender_name: this.myDeviceName,
+        receiver_id: receiverId,
+        message_type: 'direct',
+        is_mine: true,
+        is_broadcast: false,
+        timestamp: Date.now(),
+        read_status: 1,
+        delivery_status: 'sent'
+      };
+
+      // Save to database
+      await databaseService.saveMessage(dbMessage);
+      
+      // Return app format message
+      return {
+        id: dbMessage.id,
+        text: text,
+        senderId: this.myDeviceId,
+        senderName: this.myDeviceName,
+        receiverId: receiverId,
+        timestamp: Date.now(),
+        isMine: true,
+        isBroadcast: false,
+        type: 'text',
+        read: true
+      };
+    } catch (error) {
       console.error('Send message failed:', error);
-      return this.queueOutgoingMessage(receiverId, text, replyTo);
+      return this.queueOutgoingMessage(receiverId, text);
+    }
+  }
+
+  async sendMeshMessage(receiverId, text) {
+    try {
+      console.log(`Sending mesh to ${receiverId}: ${text}`);
+      const canSend = await this.isReceiverOnline(receiverId);
+      if (!canSend || this.isInCooldown(receiverId)) {
+        return this.queueOutgoingMessage(receiverId, text);
+      }
+      if (Bridgefy.sendMeshMessage) {
+        const response = await Bridgefy.sendMeshMessage(receiverId, text);
+        if (response?.id) {
+          this.pendingSendMap.set(response.id, receiverId);
+        }
+        const dbMessage = {
+          id: response?.id || `sent_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+          content: text,
+          sender_id: this.myDeviceId,
+          sender_name: this.myDeviceName,
+          receiver_id: receiverId,
+          message_type: 'direct',
+          is_mine: true,
+          is_broadcast: false,
+          timestamp: Date.now(),
+          read_status: 1,
+          delivery_status: 'sent'
+        };
+
+        await databaseService.saveMessage(dbMessage);
+        return {
+          id: dbMessage.id,
+          text: text,
+          senderId: this.myDeviceId,
+          senderName: this.myDeviceName,
+          receiverId: receiverId,
+          timestamp: Date.now(),
+          isMine: true,
+          isBroadcast: false,
+          type: 'text',
+          read: true
+        };
+      }
+      return this.queueOutgoingMessage(receiverId, text);
+    } catch (error) {
+      console.error('Mesh send failed:', error);
+      return this.queueOutgoingMessage(receiverId, text);
     }
   }
 
@@ -1194,7 +1241,7 @@ class BridgefyService {
         // Not JSON — regular chat broadcast, fall through
       }
 
-      if (this._getDirectListFromCache({ freshOnly: true }).length === 0) {
+      if (this.connectedDevices.size === 0) {
         return this.queueBroadcastMessage(text, replyTo);
       }
 
@@ -1211,7 +1258,7 @@ class BridgefyService {
         dbMsg.id = response.id || dbMsg.id;
         dbMsg.delivery_status = 'sent';
       } catch (sendErr) {
-        dbMsg.delivery_status = 'queued';
+        dbMsg.delivery_status = 'failed';
       }
       await databaseService.saveMessage(dbMsg);
       return this._buildAppMessage(dbMsg);
@@ -1225,54 +1272,25 @@ class BridgefyService {
       const devices = await Bridgefy.getConnectedDevices();
       this.lastDirectScanAt = Date.now();
       if (devices && Array.isArray(devices)) {
-        if (devices.length === 0) {
-          // Avoid clearing nearby on transient empty scan
-          if (this.directCache.size === 0 && this.connectedDevices.size > 0) {
-            const now = Date.now();
-            for (const [id, name] of this.connectedDevices.entries()) {
-              this.directCache.set(id, { name, lastSeen: now });
-            }
-          }
-          return this._getDirectListFromCache({ freshOnly: true });
-        }
-        const seen = new Set();
         for (const device of devices) {
           const id = device?.userId || device?.id;
           const name = device?.deviceName || device?.name;
           if (id) {
-            this.connectedDevices.set(id, name || `Device_${id.substring(0, 8)}`);
-            seen.add(id);
+            const resolvedName = await this._resolvePeerName(id, name);
+            this.connectedDevices.set(id, resolvedName);
             await databaseService.saveDevice({
               id: id,
-              name: name || `Device_${id.substring(0, 8)}`,
+              name: resolvedName,
               connection_status: 'online'
             });
-            this.deviceLastSeen.set(id, Date.now());
-            this.directCache.set(id, { name: name || `Device_${id.substring(0, 8)}`, lastSeen: Date.now() });
-            this.directActivity.set(id, Date.now());
-            this.directStickyUntil.set(id, Date.now() + DIRECT_MIN_NEARBY_MS);
           }
         }
-        // Do not prune here; removal is handled by onDeviceLost + grace timer.
       }
-      return this._getDirectListFromCache({ freshOnly: true });
+      return Array.from(this.connectedDevices.entries()).map(([id, name]) => ({ id, name }));
     } catch (error) {
-      console.error('Error getting devices from Bridgefy, using database cache:', error);
-      try {
-        const devices = await databaseService.getAllDevices();
-        const onlineDevices = devices.filter(device =>
-          device.id !== this.myDeviceId && device.connection_status === 'online'
-        );
-        onlineDevices.forEach(device => {
-          this.connectedDevices.set(device.id, device.name);
-          if (device.battery != null) this.deviceBatteries.set(device.id, device.battery);
-          if (device.last_seen)       this.deviceLastSeen.set(device.id, device.last_seen);
-        });
-        return this._getDirectListFromCache({ freshOnly: true });
-      } catch (dbError) {
-        console.error('Error getting devices from database:', dbError);
-        return this._getDirectListFromCache({ freshOnly: true });
-      }
+      console.error('Error getting devices from Bridgefy:', error);
+      // Direct peers must come only from live Bridgefy state, never DB cache.
+      return Array.from(this.connectedDevices.entries()).map(([id, name]) => ({ id, name }));
     }
   }
 
@@ -1280,9 +1298,16 @@ class BridgefyService {
     try {
       const minLastSeen = Date.now() - ANNOUNCE_TTL_MS;
       const users = await databaseService.getKnownUsers(minLastSeen);
-      const directIds = new Set(this.connectedDevices.keys());
+      const normalizeId = (id) => String(id || '').trim().toLowerCase();
+      const directIds = new Set(Array.from(this.connectedDevices.keys()).map(normalizeId));
       return users
-        .filter(u => u.id !== this.myDeviceId && !directIds.has(u.id))
+        .filter((u) => {
+          const userId = normalizeId(u.id);
+          if (!userId || userId === normalizeId(this.myDeviceId)) return false;
+          if (directIds.has(userId)) return false;
+          const hops = Number(u.hops);
+          return Number.isFinite(hops) ? hops > 0 : true;
+        })
         .map(u => ({
           id: u.id,
           name: u.name,
@@ -1432,12 +1457,12 @@ class BridgefyService {
   }
 
   isDirectDevice(deviceId) {
-    return this._isDirectFresh(deviceId);
+    return this.connectedDevices.has(deviceId);
   }
 
   async isReceiverOnline(receiverId) {
     try {
-      if (this._isDirectFresh(receiverId)) return true;
+      if (this.connectedDevices.has(receiverId)) return true;
       const user = await databaseService.getKnownUser(receiverId);
       if (!user) return false;
       const fresh = Date.now() - user.last_seen <= ANNOUNCE_TTL_MS;
@@ -1483,8 +1508,8 @@ class BridgefyService {
       isInitializing: this.isInitializing,
       lastAnnounceAt: this.lastAnnounceAt || 0,
       lastDirectScanAt: this.lastDirectScanAt || 0,
-      directFreshCount: this._getDirectListFromCache({ freshOnly: true }).length,
-      directCachedCount: this.directCache.size,
+      directFreshCount: this.connectedDevices.size,
+      directCachedCount: this.connectedDevices.size,
     };
   }
 
@@ -1513,7 +1538,9 @@ class BridgefyService {
       const packet = JSON.stringify({
         type: 'announce',
         deviceId: this.myDeviceId,
+        userId: this.myDeviceId,
         name: this.myDeviceName,
+        userName: this.myDeviceName,
         battery,
         timestamp: Date.now(),
       });
@@ -1525,21 +1552,22 @@ class BridgefyService {
     const senderId = parsed.deviceId || rawSenderId;
     if (!senderId || senderId === this.myDeviceId) return;
 
-    // Announce name always wins â€” it's the user's chosen display name
-    const name = parsed.name || this.connectedDevices.get(senderId) || `Device_${senderId.substring(0, 8)}`;
-    this.connectedDevices.set(senderId, name);
+    // Announce updates mesh metadata only; it must not create direct peers.
+    const name = parsed.name || `Device_${senderId.substring(0, 8)}`;
 
     if (parsed.battery != null) this.deviceBatteries.set(senderId, parsed.battery);
     this.deviceLastSeen.set(senderId, parsed.timestamp || Date.now());
 
-    // Update device record
-    databaseService.saveDevice({
-      id: senderId,
-      name,
-      connection_status: 'online',
-      last_seen: parsed.timestamp || Date.now(),
-      battery: parsed.battery ?? null,
-    }).catch(() => {});
+    // Only a direct Bridgefy scan should mark a peer as directly online.
+    if (this.connectedDevices.has(senderId)) {
+      databaseService.saveDevice({
+        id: senderId,
+        name,
+        connection_status: 'online',
+        last_seen: parsed.timestamp || Date.now(),
+        battery: parsed.battery ?? null,
+      }).catch(() => {});
+    }
 
     // Update conversation record so HomeScreen shows correct name immediately
     databaseService.executeQuery(
@@ -1865,7 +1893,13 @@ class BridgefyService {
       if (this._appStateSubscription) {
         this._appStateSubscription.remove();
         this._appStateSubscription = null;
-      }      if (this._locationInterval) clearInterval(this._locationInterval);
+      }
+      if (this.backgroundOfflineTimer) {
+        clearTimeout(this.backgroundOfflineTimer);
+        this.backgroundOfflineTimer = null;
+      }
+      this._clearPostInitDirectRefreshTimers();
+      if (this._locationInterval) clearInterval(this._locationInterval);
       gatewayService.destroy();
       weatherService.stop();
       await Bridgefy.stop();
