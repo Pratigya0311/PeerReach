@@ -26,6 +26,11 @@ import BridgefyService from '../services/BridgefyService';
 import { useTheme } from '../theme';
 import { formatTime, formatDateTime, formatElapsed } from '../utils/timeFormat';
 import { requestLocationPermission } from '../utils/permissions';
+import {
+  REACHABILITY_COPY,
+  getAttachmentRestrictionCopy,
+  getChatEmptyStateSubtext,
+} from '../utils/reachability';
 import LoadingScreen from '../components/LoadingScreen';
 import { SHOW_SOS_FINDME_KEY } from '../constants/storageKeys';
 
@@ -406,11 +411,11 @@ const ChatScreen = ({ route, navigation }) => {
   };
 
   // ─── Send file ────────────────────────────────────────────────────────────
-  // ─── Send SOS (always broadcasts to all nearby devices) ──────────────────
+  // ─── Send SOS ─────────────────────────────────────────────────────────────
   const sendSOS = () => {
     Alert.alert(
       'Send SOS',
-      'This will broadcast an emergency alert with your location to all nearby devices.',
+      REACHABILITY_COPY.sosWarning,
       [
         { text: 'Cancel', style: 'cancel' },
         {
@@ -505,7 +510,8 @@ const ChatScreen = ({ route, navigation }) => {
   const pickAndSendPhoto = async () => {
     if (isSending) return;
     if (!isBroadcast && isMeshReachable) {
-      Alert.alert('Mesh only supports text', 'Move closer to send photos directly.');
+      const restrictionCopy = getAttachmentRestrictionCopy('photo');
+      Alert.alert(restrictionCopy.title, restrictionCopy.message);
       return;
     }
     try {
@@ -536,7 +542,8 @@ const ChatScreen = ({ route, navigation }) => {
   const shareLocation = async () => {
     if (isSending) return;
     if (!isBroadcast && isMeshReachable) {
-      Alert.alert('Mesh only supports text', 'Move closer to share location directly.');
+      const restrictionCopy = getAttachmentRestrictionCopy('location');
+      Alert.alert(restrictionCopy.title, restrictionCopy.message);
       return;
     }
     try {
@@ -1033,15 +1040,6 @@ const ChatScreen = ({ route, navigation }) => {
             </Text>
           </View>
         )}
-        {!isBroadcast && isDeviceOnline && isMeshReachable && (
-          <View style={styles.meshBanner}>
-            <Icon name="route" size={14} color="#0b5ed7" style={{ marginRight: 6 }} />
-            <Text style={styles.meshBannerText}>
-              Reachable via mesh — messages will hop through nearby devices
-            </Text>
-          </View>
-        )}
-
         {renderPinnedBanner()}
 
         <View style={{ flex: 1 }}>
@@ -1077,9 +1075,7 @@ const ChatScreen = ({ route, navigation }) => {
                   {isBroadcast ? 'No broadcast messages yet' : `Start chatting with ${deviceName}`}
                 </Text>
                 <Text style={styles.emptySubtext}>
-                  {isBroadcast
-                    ? 'Messages will be sent to all nearby devices'
-                    : 'Direct messages are encrypted once the secure channel is ready'}
+                  {getChatEmptyStateSubtext()}
                 </Text>
               </View>
             }
@@ -1443,13 +1439,6 @@ const makeStyles = (colors) => StyleSheet.create({
     borderBottomWidth: 1, borderBottomColor: '#ffc107',
   },
   offlineBannerText: { fontSize: 12, color: '#856404', flex: 1 },
-  meshBanner: {
-    flexDirection: 'row', alignItems: 'center',
-    backgroundColor: '#e7f1ff',
-    paddingHorizontal: 14, paddingVertical: 8,
-    borderBottomWidth: 1, borderBottomColor: '#cfe2ff',
-  },
-  meshBannerText: { fontSize: 12, color: '#0b5ed7', flex: 1 },
 
   // ── Scroll-to-bottom FAB ──────────────────────────────────────────────────
   scrollBtn: {

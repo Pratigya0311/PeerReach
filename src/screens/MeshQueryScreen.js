@@ -48,21 +48,13 @@ const MeshQueryScreen = ({ navigation }) => {
 
     const refreshStatus = () => {
       setPeerCount(BridgefyService.connectedDevices?.size ?? 0);
+      setPendingCount(gatewayService.getPendingQueueCount());
       gatewayService.checkInternet()
         .then(setIsGateway)
         .catch(() => setIsGateway(false));
     };
     refreshStatus();
     const statusInterval = setInterval(refreshStatus, 10000);
-
-    gatewayService.getCacheHistory()
-      .then(history => {
-        setResults(history.map(h => ({
-          query: h.query, result: h.result,
-          source: 'cache', timestamp: h.timestamp,
-        })));
-      })
-      .catch(err => console.error('Failed to load cache history:', err));
 
     gatewayService.setOnQueryResultCallback(({ result, query: q, delayed }) => {
       if (delayed) {

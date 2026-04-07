@@ -12,6 +12,7 @@ import { useFocusEffect } from '@react-navigation/native';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 import BridgefyService from '../services/BridgefyService';
 import { useTheme } from '../theme';
+import { REACHABILITY_COPY } from '../utils/reachability';
 
 const DevicesScreen = ({ navigation }) => {
   const colors = useTheme();
@@ -134,19 +135,6 @@ const DevicesScreen = ({ navigation }) => {
           {item.battery != null && (
             <Text style={styles.batteryText}>{item.battery}% battery</Text>
           )}
-          <View style={styles.tagRow}>
-            {item.isNearby ? (
-              <View style={[styles.tag, styles.tagNearby]}>
-                <Text style={styles.tagText}>Nearby</Text>
-              </View>
-            ) : (
-              <View style={[styles.tag, styles.tagMesh]}>
-                <Text style={styles.tagText}>
-                  Mesh{item.hops != null ? ` • ${item.hops} hops` : ''}
-                </Text>
-              </View>
-            )}
-          </View>
         </View>
 
         <View style={styles.connectionDot} />
@@ -154,13 +142,6 @@ const DevicesScreen = ({ navigation }) => {
       </TouchableOpacity>
     );
   };
-
-  const sectionHeader = (title, count) => (
-    <View style={styles.sectionHeader}>
-      <Text style={styles.sectionTitle}>{title}</Text>
-      <Text style={styles.sectionCount}>{count}</Text>
-    </View>
-  );
 
   const formatAge = (ts) => {
     if (!ts) return 'never';
@@ -171,10 +152,8 @@ const DevicesScreen = ({ navigation }) => {
   const hasDevices = nearby.length + reachable.length > 0;
   const mergedData = hasDevices
     ? [
-        { type: 'section', id: 'nearby_header', title: 'Nearby', count: nearby.length },
-        ...nearby.map(d => ({ ...d, isNearby: true, type: 'item' })),
-        { type: 'section', id: 'mesh_header', title: 'Reachable (Mesh)', count: reachable.length },
-        ...reachable.map(d => ({ ...d, isNearby: false, type: 'item' })),
+        ...nearby.map(d => ({ ...d, isNearby: true })),
+        ...reachable.map(d => ({ ...d, isNearby: false })),
       ]
     : [];
 
@@ -186,7 +165,7 @@ const DevicesScreen = ({ navigation }) => {
             <Text style={styles.title}>Select Device</Text>
             <Text style={styles.subtitle}>Tap a device to start chatting</Text>
             <Text style={styles.scanHealth}>
-              Scan: {formatAge(scanHealth.lastDirectScanAt)} · Announce: {formatAge(scanHealth.lastAnnounceAt)} · Nearby: {scanHealth.directFreshCount ?? 0}
+              Scan: {formatAge(scanHealth.lastDirectScanAt)} · Announce: {formatAge(scanHealth.lastAnnounceAt)}
             </Text>
           </View>
           <TouchableOpacity
@@ -202,20 +181,24 @@ const DevicesScreen = ({ navigation }) => {
             }}
           >
             <Icon name="refresh" size={18} color={colors.onColor} />
-            <Text style={styles.refreshNearbyText}>Nearby</Text>
+            <Text style={styles.refreshNearbyText}>{REACHABILITY_COPY.refreshLabel}</Text>
           </TouchableOpacity>
         </View>
       </View>
 
       <FlatList
         data={mergedData}
-        renderItem={({ item }) => (
-          item.type === 'section'
-            ? sectionHeader(item.title, item.count)
-            : renderDevice({ item })
-        )}
+        renderItem={renderDevice}
         keyExtractor={(item) => item.id}
         contentContainerStyle={styles.list}
+        ListHeaderComponent={
+          hasDevices ? (
+            <View style={styles.sectionHeader}>
+              <Text style={styles.sectionTitle}>{REACHABILITY_COPY.chatsSectionTitle}</Text>
+              <Text style={styles.sectionCount}>{mergedData.length}</Text>
+            </View>
+          ) : null
+        }
         refreshControl={
           <RefreshControl
             refreshing={refreshing}
@@ -229,7 +212,7 @@ const DevicesScreen = ({ navigation }) => {
             <Icon name="search" size={64} color={colors.textMuted} style={styles.emptyIcon} />
             <Text style={styles.emptyText}>No devices found</Text>
             <Text style={styles.emptySubtext}>
-              Make sure other devices have PeerReach running nearby
+              {REACHABILITY_COPY.devicePickerHint}
             </Text>
             <TouchableOpacity style={styles.refreshButton} onPress={onRefresh}>
               <Text style={styles.refreshButtonText}>Refresh</Text>
@@ -284,11 +267,6 @@ const makeStyles = (colors) => StyleSheet.create({
   deviceName:     { fontSize: 16, fontWeight: '600', color: colors.text, marginBottom: 4 },
   deviceId:       { fontSize: 12, color: colors.textMuted },
   batteryText:    { fontSize: 11, color: colors.textMuted, marginTop: 2 },
-  tagRow:         { flexDirection: 'row', marginTop: 6 },
-  tag:            { paddingHorizontal: 8, paddingVertical: 3, borderRadius: 10 },
-  tagNearby:      { backgroundColor: colors.success + '22' },
-  tagMesh:        { backgroundColor: colors.accent + '22' },
-  tagText:        { fontSize: 11, color: colors.text },
   connectionDot:  { width: 10, height: 10, borderRadius: 5, backgroundColor: colors.success, marginRight: 8 },
   connectText:    { color: colors.connectText, fontSize: 14, fontWeight: '600' },
 
