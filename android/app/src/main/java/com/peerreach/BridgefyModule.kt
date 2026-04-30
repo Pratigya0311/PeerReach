@@ -1,6 +1,11 @@
 package com.peerreach
 
+import android.content.Context
 import android.util.Log
+import android.bluetooth.BluetoothAdapter
+import android.content.BroadcastReceiver
+import android.content.Intent
+import android.content.IntentFilter
 import com.facebook.react.bridge.*
 import com.facebook.react.modules.core.DeviceEventManagerModule
 import org.json.JSONObject
@@ -21,7 +26,24 @@ class BridgefyModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
     private var isStarting: Boolean = false
     private var deviceName: String = "Unknown Device"
     private var connectedDevices = mutableMapOf<UUID, String>()
-    private var knownNames = mutableMapOf<UUID, String>()
+    private val pendingReceiverIds: ArrayDeque<String> = ArrayDeque()
+    private var bluetoothReceiver: BroadcastReceiver? = null
+
+    init {
+        if (bluetoothReceiver == null) {
+            bluetoothReceiver = object : BroadcastReceiver() {
+                override fun onReceive(context: Context?, intent: Intent?) {
+                    if (intent?.action == BluetoothAdapter.ACTION_STATE_CHANGED) {
+                        val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
+                        val enabled = state == BluetoothAdapter.STATE_ON
+                        emitBluetoothState(enabled)
+                    }
+                }
+            }
+            val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
+            reactApplicationContext.registerReceiver(bluetoothReceiver, filter)
+        }
+    }
 
     override fun getName(): String {
         return "Bridgefy"
@@ -40,6 +62,32 @@ class BridgefyModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
                 .emit(eventName, params)
         } catch (e: Exception) {
             Log.e("BridgefyModule", "Failed to send event: $eventName", e)
+        }
+    }
+
+    private fun emitBluetoothState(enabled: Boolean) {
+        val params = Arguments.createMap()
+        params.putBoolean("enabled", enabled)
+        sendEvent("onBluetoothStateChanged", params)
+    }
+
+    override fun onCatalystInstanceDestroy() {
+        super.onCatalystInstanceDestroy()
+        try {
+            if (bluetoothReceiver != null) {
+                reactApplicationContext.unregisterReceiver(bluetoothReceiver)
+                bluetoothReceiver = null
+            }
+        } catch (_e: Exception) { }
+    }
+
+    @ReactMethod
+    fun getBluetoothState(promise: Promise) {
+        try {
+            val adapter = BluetoothAdapter.getDefaultAdapter()
+            promise.resolve(adapter != null && adapter.isEnabled)
+        } catch (e: Exception) {
+            promise.resolve(false)
         }
     }
 
@@ -70,9 +118,7 @@ class BridgefyModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
                 is Long -> params.putDouble(key, value.toDouble())
                 is Double -> params.putDouble(key, value)
                 is Boolean -> params.putBoolean(key, value)
-                else -> {
-                    params.putString(key, value.toString())
-                }
+                else -> params.putString(key, value.toString())
             }
         }
     }
@@ -117,50 +163,41 @@ class BridgefyModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
         override fun onReceiveData(data: ByteArray, messageID: UUID, transmissionMode: TransmissionMode) {
             try {
                 Log.i("BridgefyModule", "Message received, length: ${data.size} bytes")
-                
-                // Parse the message data
+
                 val messageData = parseMessageData(data)
-                val content = messageData["text"] as? String ?: String(data, Charsets.UTF_8)
+                val messageType = messageData["type"] as? String ?: "text"
                 val senderId = messageData["senderId"] as? String
                 val senderName = messageData["senderName"] as? String
-                val messageType = messageData["type"] as? String ?: "text"
-                
+
+                // For plain text messages, extract just the text field.
+                // For all other types (photo, location, gateway protocol, etc.) pass the
+                // full raw JSON so the JS layer can decode the payload correctly.
+                val content = if (messageType == "text") {
+                    messageData["text"] as? String ?: String(data, Charsets.UTF_8)
+                } else {
+                    String(data, Charsets.UTF_8)
+                }
+
                 val params = Arguments.createMap()
                 params.putString("content", content)
                 params.putString("messageId", messageID.toString())
                 params.putString("timestamp", System.currentTimeMillis().toString())
                 params.putString("type", messageType)
-                
-                if (senderId != null) {
-                    params.putString("senderId", senderId)
-                }
-                
-                if (senderName != null) {
-                    params.putString("senderName", senderName)
-                }
+
+                if (senderId != null) params.putString("senderId", senderId)
+                if (senderName != null) params.putString("senderName", senderName)
 
                 addExtraParams(messageData, params)
-                
-                // Store sender info for device name mapping
-                if (senderId != null && senderName != null) {
-                    try {
-                        val uuid = UUID.fromString(senderId)
-                        knownNames[uuid] = senderName
-                    } catch (e: Exception) {
-                        Log.w("BridgefyModule", "Invalid sender ID in message: $senderId")
-                    }
-                }
-                
-                // Determine if it's broadcast
+
                 val isBroadcast = transmissionMode is TransmissionMode.Broadcast
                 params.putBoolean("isBroadcast", isBroadcast)
-                
+
                 if (isBroadcast) {
                     sendEvent("onBroadcastMessageReceived", params)
                 } else {
                     sendEvent("onMessageReceived", params)
                 }
-                
+
             } catch (e: Exception) {
                 Log.e("BridgefyModule", "Error processing message", e)
             }
@@ -203,6 +240,9 @@ class BridgefyModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
 
         override fun onSend(messageID: UUID) {
             Log.i("BridgefyModule", "Message sent: $messageID")
+            if (pendingReceiverIds.isNotEmpty()) {
+                pendingReceiverIds.removeFirst()
+            }
             
             val params = Arguments.createMap()
             params.putString("messageId", messageID.toString())
@@ -215,17 +255,25 @@ class BridgefyModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
 
         override fun onFailToSend(messageID: UUID, error: BridgefyException) {
             Log.e("BridgefyModule", "Failed to send $messageID: ${error.message}")
+            val receiverId = if (pendingReceiverIds.isNotEmpty()) pendingReceiverIds.removeFirst() else null
             
             val params = Arguments.createMap()
             params.putString("messageId", messageID.toString())
             params.putString("error", error.message)
+            if (receiverId != null) {
+                params.putString("receiverId", receiverId)
+            }
             sendEvent("onMessageSendFailed", params)
         }
 
         override fun onDestroySession() {}
         override fun onFailToDestroySession(error: BridgefyException) {}
-        override fun onEstablishSecureConnection(userId: UUID) {}
-        override fun onFailToEstablishSecureConnection(userId: UUID, error: BridgefyException) {}
+        override fun onEstablishSecureConnection(userId: UUID) {
+            Log.i("BridgefyModule", "Secure connection established with: $userId")
+        }
+        override fun onFailToEstablishSecureConnection(userId: UUID, error: BridgefyException) {
+            Log.e("BridgefyModule", "Secure connection FAILED with $userId: ${error.message}")
+        }
     }
 
     private fun sendDeviceListUpdate() {
@@ -243,6 +291,13 @@ class BridgefyModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
         sendEvent("onDeviceListUpdated", params)
     }
 
+    // Required by NativeEventEmitter in New Architecture
+    @ReactMethod
+    fun addListener(eventName: String) { /* no-op */ }
+
+    @ReactMethod
+    fun removeListeners(count: Int) { /* no-op */ }
+
     @ReactMethod
     fun initialize(apiKey: String) {
         try {
@@ -254,6 +309,7 @@ class BridgefyModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
                 return
             }
             if (isStarting) {
+                Log.i("BridgefyModule", "Already initializing — ignoring duplicate call")
                 return
             }
             isStarting = true
@@ -273,8 +329,22 @@ class BridgefyModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
                 bridgefyDelegate    // Arg 2: Delegate
             )
 
-            // ✅ 3. Start the service
-            bridgefy?.start(null, PropagationProfile.Standard)
+            // ✅ 3. Start the service with a stable, persisted UUID so the SDK
+            //    reuses the same cryptographic identity across restarts.
+            //    Passing null generates a new random UUID every time, which
+            //    forces a fresh key exchange on every connection and causes
+            //    the connect → immediately-disconnect → never-reconnects loop.
+            val prefs = reactApplicationContext.getSharedPreferences("BridgefyPrefs", Context.MODE_PRIVATE)
+            val storedId = prefs.getString("userId", null)
+            val userId: UUID = if (storedId != null) {
+                UUID.fromString(storedId)
+            } else {
+                val newId = UUID.randomUUID()
+                prefs.edit().putString("userId", newId.toString()).apply()
+                newId
+            }
+            Log.i("BridgefyModule", "Starting with stable userId: $userId")
+            bridgefy?.start(userId, PropagationProfile.Standard)
 
         } catch (e: IllegalArgumentException) {
             Log.e("BridgefyModule", "Invalid API key format", e)
@@ -305,36 +375,39 @@ class BridgefyModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
 
     @ReactMethod
     fun sendMessage(receiverId: String, text: String, promise: Promise) {
+        val userId = currentUserId
+        if (userId == null) {
+            promise.reject("USER_NOT_INITIALIZED", "User not initialized yet")
+            return
+        }
+        val b = bridgefy
+        if (b == null) {
+            promise.reject("NOT_INITIALIZED", "Bridgefy not initialized")
+            return
+        }
         try {
             val receiverUUID = UUID.fromString(receiverId)
-            
-            // Create structured message with sender info
             val messageObject = mapOf(
                 "type" to "text",
                 "text" to text,
-                "senderId" to currentUserId.toString(),
+                "senderId" to userId.toString(),
                 "senderName" to deviceName,
                 "timestamp" to System.currentTimeMillis(),
                 "isBroadcast" to false
             )
-            
             val jsonString = JSONObject(messageObject).toString()
             val bytes = jsonString.toByteArray(Charsets.UTF_8)
-            
-            // Send using P2P transmission
-            bridgefy?.send(bytes, TransmissionMode.P2P(receiverUUID))
-            
-            // Create response
+            pendingReceiverIds.addLast(receiverId)
+            b.send(bytes, TransmissionMode.P2P(receiverUUID))
             val result = Arguments.createMap()
             result.putString("id", UUID.randomUUID().toString())
             result.putString("text", text)
-            result.putString("senderId", currentUserId.toString())
+            result.putString("senderId", userId.toString())
             result.putString("senderName", deviceName)
             result.putString("receiverId", receiverId)
             result.putString("timestamp", System.currentTimeMillis().toString())
             result.putBoolean("isMine", true)
             result.putBoolean("isBroadcast", false)
-            
             promise.resolve(result)
         } catch (e: IllegalArgumentException) {
             promise.reject("INVALID_RECEIVER_ID", "Invalid receiver ID format")
@@ -345,33 +418,39 @@ class BridgefyModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
 
     @ReactMethod
     fun sendMeshMessage(receiverId: String, text: String, promise: Promise) {
+        val userId = currentUserId
+        if (userId == null) {
+            promise.reject("USER_NOT_INITIALIZED", "User not initialized yet")
+            return
+        }
+        val b = bridgefy
+        if (b == null) {
+            promise.reject("NOT_INITIALIZED", "Bridgefy not initialized")
+            return
+        }
         try {
             val receiverUUID = UUID.fromString(receiverId)
-
             val messageObject = mapOf(
                 "type" to "text",
                 "text" to text,
-                "senderId" to currentUserId.toString(),
+                "senderId" to userId.toString(),
                 "senderName" to deviceName,
                 "timestamp" to System.currentTimeMillis(),
                 "isBroadcast" to false
             )
-
             val jsonString = JSONObject(messageObject).toString()
             val bytes = jsonString.toByteArray(Charsets.UTF_8)
-
-            bridgefy?.send(bytes, TransmissionMode.Mesh(receiverUUID))
-
+            pendingReceiverIds.addLast(receiverId)
+            b.send(bytes, TransmissionMode.Mesh(receiverUUID))
             val result = Arguments.createMap()
             result.putString("id", UUID.randomUUID().toString())
             result.putString("text", text)
-            result.putString("senderId", currentUserId.toString())
+            result.putString("senderId", userId.toString())
             result.putString("senderName", deviceName)
             result.putString("receiverId", receiverId)
             result.putString("timestamp", System.currentTimeMillis().toString())
             result.putBoolean("isMine", true)
             result.putBoolean("isBroadcast", false)
-
             promise.resolve(result)
         } catch (e: IllegalArgumentException) {
             promise.reject("INVALID_RECEIVER_ID", "Invalid receiver ID format")
@@ -381,14 +460,78 @@ class BridgefyModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
     }
 
     @ReactMethod
-    fun sendBroadcastPayload(payloadJson: String, promise: Promise) {
+    fun sendBroadcast(text: String, promise: Promise) {
+        val userId = currentUserId
+        if (userId == null) {
+            promise.reject("USER_NOT_INITIALIZED", "User not initialized yet")
+            return
+        }
+        val b = bridgefy
+        if (b == null) {
+            promise.reject("NOT_INITIALIZED", "Bridgefy not initialized")
+            return
+        }
         try {
-            val userId = currentUserId ?: run {
-                promise.reject("USER_NOT_INITIALIZED", "User not initialized yet")
-                return
-            }
+            val messageObject = mapOf(
+                "type" to "text",
+                "text" to text,
+                "senderId" to userId.toString(),
+                "senderName" to deviceName,
+                "timestamp" to System.currentTimeMillis(),
+                "isBroadcast" to true
+            )
+            val jsonString = JSONObject(messageObject).toString()
+            val bytes = jsonString.toByteArray(Charsets.UTF_8)
+            b.send(bytes, TransmissionMode.Broadcast(userId))
+            val result = Arguments.createMap()
+            result.putString("id", UUID.randomUUID().toString())
+            result.putString("text", text)
+            result.putString("senderId", userId.toString())
+            result.putString("senderName", deviceName)
+            result.putString("timestamp", System.currentTimeMillis().toString())
+            result.putBoolean("isMine", true)
+            result.putBoolean("isBroadcast", true)
+            promise.resolve(result)
+        } catch (e: Exception) {
+            promise.reject("BROADCAST_ERROR", e.message ?: "Failed to broadcast")
+        }
+    }
+    
+    // Sends a pre-built JSON payload (photo, location, gateway protocol) directly
+    // without the text-message wrapper that sendMessage/sendBroadcast add.
+    @ReactMethod
+    fun sendPayload(receiverId: String, payload: String, promise: Promise) {
+        val b = bridgefy ?: run {
+            promise.reject("NOT_INITIALIZED", "Bridgefy is not initialized yet")
+            return
+        }
+        try {
+            val receiverUUID = UUID.fromString(receiverId)
+            val bytes = payload.toByteArray(Charsets.UTF_8)
+            pendingReceiverIds.addLast(receiverId)
+            b.send(bytes, TransmissionMode.P2P(receiverUUID))
+            val result = Arguments.createMap()
+            result.putString("id", UUID.randomUUID().toString())
+            promise.resolve(result)
+        } catch (e: IllegalArgumentException) {
+            promise.reject("INVALID_RECEIVER_ID", "Invalid receiver ID format")
+        } catch (e: Exception) {
+            promise.reject("SEND_ERROR", e.message ?: "Failed to send payload")
+        }
+    }
 
-            val jsonObject = JSONObject(payloadJson)
+    @ReactMethod
+    fun sendBroadcastPayload(payload: String, promise: Promise) {
+        val b = bridgefy ?: run {
+            promise.reject("NOT_INITIALIZED", "Bridgefy is not initialized yet")
+            return
+        }
+        val userId = currentUserId ?: run {
+            promise.reject("USER_NOT_INITIALIZED", "User not initialized yet")
+            return
+        }
+        try {
+            val jsonObject = JSONObject(payload)
             if (!jsonObject.has("senderId")) {
                 jsonObject.put("senderId", userId.toString())
             }
@@ -398,53 +541,16 @@ class BridgefyModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
             if (!jsonObject.has("timestamp")) {
                 jsonObject.put("timestamp", System.currentTimeMillis())
             }
-
             val bytes = jsonObject.toString().toByteArray(Charsets.UTF_8)
-            bridgefy?.send(bytes, TransmissionMode.Broadcast(userId))
-            promise.resolve(true)
+            b.send(bytes, TransmissionMode.Broadcast(userId))
+            val result = Arguments.createMap()
+            result.putString("id", UUID.randomUUID().toString())
+            promise.resolve(result)
         } catch (e: Exception) {
-            promise.reject("BROADCAST_ERROR", e.message ?: "Failed to send broadcast payload")
+            promise.reject("BROADCAST_ERROR", e.message ?: "Failed to broadcast payload")
         }
     }
 
-    @ReactMethod
-    fun sendBroadcast(text: String, promise: Promise) {
-        try {
-            currentUserId?.let { userId ->
-                // Create structured message with sender info
-                val messageObject = mapOf(
-                    "type" to "text",
-                    "text" to text,
-                    "senderId" to userId.toString(),
-                    "senderName" to deviceName,
-                    "timestamp" to System.currentTimeMillis(),
-                    "isBroadcast" to true
-                )
-                
-                val jsonString = JSONObject(messageObject).toString()
-                val bytes = jsonString.toByteArray(Charsets.UTF_8)
-                
-                bridgefy?.send(bytes, TransmissionMode.Broadcast(userId))
-                
-                // Create response
-                val result = Arguments.createMap()
-                result.putString("id", UUID.randomUUID().toString())
-                result.putString("text", text)
-                result.putString("senderId", userId.toString())
-                result.putString("senderName", deviceName)
-                result.putString("timestamp", System.currentTimeMillis().toString())
-                result.putBoolean("isMine", true)
-                result.putBoolean("isBroadcast", true)
-                
-                promise.resolve(result)
-            } ?: run {
-                promise.reject("USER_NOT_INITIALIZED", "User not initialized yet")
-            }
-        } catch (e: Exception) {
-            promise.reject("BROADCAST_ERROR", e.message ?: "Failed to broadcast")
-        }
-    }
-    
     @ReactMethod
     fun stop() {
         bridgefy?.stop()
